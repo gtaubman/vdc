@@ -3,6 +3,8 @@ package server
 import (
 	"archive/tar"
 	"bytes"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/rpc"
@@ -10,40 +12,63 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"vdc/api"
-	"vdc/jobspec"
 
 	"github.com/google/uuid"
+	_ "modernc.org/sqlite"
 )
+
+const schema = `
+CREATE TABLE IF NOT EXISTS machines (
+	id TEXT PRIMARY KEY,
+	ram INTEGER NOT NULL,
+	disk INTEGER NOT NULL,
+	last_heartbeat INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS package_names (
+	hash TEXT PRIMARY KEY,
+	name TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runs (
+	run_id TEXT PRIMARY KEY,
+	job_name TEXT NOT NULL,
+	spec_json TEXT NOT NULL,
+	package_hashes_json TEXT NOT NULL,
+	status INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tasks (
+	task_run_id TEXT PRIMARY KEY,
+	run_id TEXT NOT NULL,
+	task_number INTEGER NOT NULL,
+	machine_id TEXT,
+	status INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS commands (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	machine_id TEXT NOT NULL,
+	type TEXT NOT NULL,
+	payload_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pull_requests (
+	request_id TEXT PRIMARY KEY,
+	total INTEGER NOT NULL,
+	tar_data BLOB
+);
+CREATE TABLE IF NOT EXISTS pull_results (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	request_id TEXT NOT NULL,
+	task_number INTEGER NOT NULL,
+	filename TEXT NOT NULL,
+	data BLOB,
+	err TEXT NOT NULL DEFAULT ''
+);
+`
 
 // Config holds server configuration.
 type Config struct {
-	// PackageDir is where uploaded packages are stored.
-	// If empty, a temporary directory is created.
 	PackageDir string
-}
-
-type taskRecord struct {
-	TaskNumber int
-	MachineID  string
-	TaskRunID  string
-	Status     api.TaskStatus
-}
-
-type taskRunRef struct {
-	task  *taskRecord
-	runID string
-}
-
-type runRecord struct {
-	RunID         string
-	JobName       string
-	Spec          jobspec.JobSpec
-	PackageHashes map[string]string
-	Tasks         []*taskRecord
-	Status        api.RunStatus
+	DBPath     string // SQLite path; "" uses ":memory:"
 }
 
 // RunSummary is a brief description of a run for the status display.
@@ -63,7 +88,7 @@ type PackageInfo struct {
 // StatusSnapshot is a point-in-time view of the datacenter for the leader display.
 type StatusSnapshot struct {
 	Machines         []api.MachineInfo
-	MachineJobCounts map[string]int // machine ID -> number of currently running tasks
+	MachineJobCounts map[string]int
 	Packages         []PackageInfo
 	Runs             []RunSummary
 }
@@ -74,28 +99,14 @@ type pullFileResult struct {
 	Data       []byte
 }
 
-type pullState struct {
-	mu       sync.Mutex
-	total    int
-	received int // successes + errors
-	results  []pullFileResult
-	errors   []api.PullFileError
-	tarData  []byte // built when received == total
-}
-
 // Server is the VDC leader server.
 type Server struct {
-	cfg          Config
-	mu           sync.Mutex
-	machines     map[string]*api.MachineInfo
-	packageNames map[string]string // content hash -> package name
-	runs         map[string]*runRecord
-	taskRunIndex map[string]taskRunRef // task run ID -> (task pointer, run ID)
-	machineQueues map[string][]api.Command
-	pullRequests  map[string]*pullState
+	cfg Config
+	db  *sql.DB
 }
 
 // New creates a new Server. If cfg.PackageDir is empty, a temp dir is created.
+// If cfg.DBPath is empty, an in-memory SQLite database is used.
 func New(cfg Config) (*Server, error) {
 	if cfg.PackageDir == "" {
 		dir, err := os.MkdirTemp("", "vdc-packages-*")
@@ -103,67 +114,103 @@ func New(cfg Config) (*Server, error) {
 			return nil, fmt.Errorf("create package dir: %w", err)
 		}
 		cfg.PackageDir = dir
+	} else if err := os.MkdirAll(cfg.PackageDir, 0755); err != nil {
+		return nil, fmt.Errorf("create package dir: %w", err)
 	}
-	return &Server{
-		cfg:           cfg,
-		machines:      make(map[string]*api.MachineInfo),
-		packageNames:  make(map[string]string),
-		runs:          make(map[string]*runRecord),
-		taskRunIndex:  make(map[string]taskRunRef),
-		machineQueues: make(map[string][]api.Command),
-		pullRequests:  make(map[string]*pullState),
-	}, nil
+
+	dbPath := cfg.DBPath
+	if dbPath == "" {
+		dbPath = ":memory:"
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("WAL mode: %w", err)
+	}
+	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("apply schema: %w", err)
+	}
+
+	return &Server{cfg: cfg, db: db}, nil
 }
 
 // PackageDir returns the directory used to store packages.
 func (s *Server) PackageDir() string { return s.cfg.PackageDir }
 
 // RegisterMachine registers a new machine with the datacenter.
-// If the machine reports ActiveTaskIDs from a previous connection, cancelled
-// tasks (those rescheduled elsewhere) receive a CancelTask command; Lost tasks
-// that were not rescheduled are reactivated under the new machine ID.
+// If the machine reports ActiveTaskIDs from a previous connection, tasks that
+// were rescheduled (no longer present in the DB) receive a CancelTask command,
+// and Lost tasks that haven't been rescheduled are reactivated.
 func (s *Server) RegisterMachine(args *api.RegisterRequest, reply *api.RegisterReply) error {
-	id := uuid.New().String()
-	s.mu.Lock()
-	s.machines[id] = &api.MachineInfo{
-		ID:            id,
-		Spec:          args.Spec,
-		LastHeartbeat: time.Now(),
+	id := args.MachineID
+	if id == "" {
+		id = uuid.New().String()
 	}
-	s.machineQueues[id] = nil
+	now := time.Now().UnixNano()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO machines (id, ram, disk, last_heartbeat) VALUES (?, ?, ?, ?)`,
+		id, args.Spec.RAM, args.Spec.Disk, now); err != nil {
+		return fmt.Errorf("insert machine: %w", err)
+	}
 
 	for _, taskRunID := range args.ActiveTaskIDs {
-		ref, ok := s.taskRunIndex[taskRunID]
-		if !ok {
-			// Task was rescheduled to another machine — cancel it here.
-			s.machineQueues[id] = append(s.machineQueues[id], api.Command{
-				Type:       api.CmdCancelTask,
-				CancelTask: &api.CancelTaskDetails{RunID: taskRunID},
-			})
+		var taskStatus int
+		err := tx.QueryRow(`SELECT status FROM tasks WHERE task_run_id = ?`, taskRunID).Scan(&taskStatus)
+		if err == sql.ErrNoRows {
+			// Task was rescheduled (old task_run_id deleted) — tell machine to cancel.
+			if err2 := insertCommand(tx, id, api.CmdCancelTask, &api.CancelTaskDetails{RunID: taskRunID}); err2 != nil {
+				return err2
+			}
 			continue
 		}
-		if ref.task.Status == api.TaskLost {
-			// Couldn't reschedule (no other machines); machine is back, reactivate.
-			ref.task.MachineID = id
-			ref.task.Status = api.TaskRunning
-			s.runs[ref.runID].Status = computeRunStatus(s.runs[ref.runID].Tasks)
+		if err != nil {
+			return err
+		}
+		if api.TaskStatus(taskStatus) == api.TaskLost {
+			// Machine reconnected before reschedule — reactivate task under new machine ID.
+			var runID string
+			if err := tx.QueryRow(`SELECT run_id FROM tasks WHERE task_run_id = ?`, taskRunID).Scan(&runID); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`UPDATE tasks SET machine_id = ?, status = ? WHERE task_run_id = ?`,
+				id, int(api.TaskRunning), taskRunID); err != nil {
+				return err
+			}
+			if err := updateRunStatus(tx, runID); err != nil {
+				return err
+			}
 		}
 	}
 
-	s.mu.Unlock()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
 	reply.MachineID = id
 	return nil
 }
 
 // Heartbeat updates the last-seen time for a machine.
 func (s *Server) Heartbeat(args *api.HeartbeatRequest, reply *api.HeartbeatReply) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	m, ok := s.machines[args.MachineID]
-	if !ok {
+	res, err := s.db.Exec(`UPDATE machines SET last_heartbeat = ? WHERE id = ?`,
+		time.Now().UnixNano(), args.MachineID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
 		return fmt.Errorf("unknown machine: %s", args.MachineID)
 	}
-	m.LastHeartbeat = time.Now()
 	return nil
 }
 
@@ -192,160 +239,229 @@ func (s *Server) FetchPackage(args *api.FetchPackageRequest, reply *api.FetchPac
 	return nil
 }
 
-// SubmitJob validates capacity, selects machines, enqueues commands, and records the job.
+// SubmitJob records the job in the database; the scan loop assigns machines.
 func (s *Server) SubmitJob(args *api.SubmitJobRequest, reply *api.SubmitJobReply) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	spec := args.Spec
-	needRAM := uint64(spec.Requirements.RAM)
-	needDisk := uint64(spec.Requirements.Disk)
-
-	// Collect all eligible machines, then assign replicas round-robin so that
-	// different machines are preferred but a single machine can run multiple tasks.
-	var eligible []string
-	for id, m := range s.machines {
-		if m.Spec.RAM >= needRAM && m.Spec.Disk >= needDisk {
-			eligible = append(eligible, id)
-		}
+	specJSON, err := json.Marshal(args.Spec)
+	if err != nil {
+		return fmt.Errorf("marshal spec: %w", err)
 	}
-	if len(eligible) == 0 {
-		return fmt.Errorf("no machines available with RAM>=%d disk>=%d", needRAM, needDisk)
-	}
-
-	selected := make([]string, spec.Replicas)
-	for i := range selected {
-		selected[i] = eligible[i%len(eligible)]
+	hashesJSON, err := json.Marshal(args.PackageHashes)
+	if err != nil {
+		return fmt.Errorf("marshal hashes: %w", err)
 	}
 
 	runID := uuid.New().String()
 
-	tasks := make([]*taskRecord, len(selected))
-	for i, machineID := range selected {
-		taskRunID := uuid.New().String()
-		task := &taskRecord{
-			TaskNumber: i,
-			MachineID:  machineID,
-			TaskRunID:  taskRunID,
-			Status:     api.TaskPending,
-		}
-		tasks[i] = task
-		s.taskRunIndex[taskRunID] = taskRunRef{task: task, runID: runID}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 
-		for _, pkg := range spec.Packages {
-			s.machineQueues[machineID] = append(s.machineQueues[machineID], api.Command{
-				Type: api.CmdFetchPackage,
-				FetchPackage: &api.FetchPackageDetails{
-					PackageName: pkg.Name,
-					PackageHash: args.PackageHashes[pkg.Name],
-				},
-			})
+	if _, err := tx.Exec(`INSERT INTO runs (run_id, job_name, spec_json, package_hashes_json, status) VALUES (?, ?, ?, ?, ?)`,
+		runID, args.Spec.Name, string(specJSON), string(hashesJSON), int(api.RunScheduling)); err != nil {
+		return err
+	}
+
+	for i := range args.Spec.Replicas {
+		taskRunID := uuid.New().String()
+		if _, err := tx.Exec(`INSERT INTO tasks (task_run_id, run_id, task_number, machine_id, status) VALUES (?, ?, ?, NULL, ?)`,
+			taskRunID, runID, i, int(api.TaskPending)); err != nil {
+			return err
 		}
-		s.machineQueues[machineID] = append(s.machineQueues[machineID], api.Command{
-			Type: api.CmdRunBinary,
-			RunBinary: &api.RunBinaryDetails{
-				RunID:       taskRunID,
-				PackageName: spec.Binary.Package,
-				BinaryPath:  spec.Binary.Path,
-				Args:        expandArgs(spec.Args, i),
-			},
-		})
 	}
 
 	for name, hash := range args.PackageHashes {
-		s.packageNames[hash] = name
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO package_names (hash, name) VALUES (?, ?)`, hash, name); err != nil {
+			return err
+		}
 	}
 
-	s.runs[runID] = &runRecord{
-		RunID:         runID,
-		JobName:       spec.Name,
-		Spec:          spec,
-		PackageHashes: args.PackageHashes,
-		Tasks:         tasks,
-		Status:        api.RunPending,
+	if err := tx.Commit(); err != nil {
+		return err
 	}
-
 	reply.RunID = runID
 	return nil
 }
 
 // ReportTaskStatus is called by a machine to update its task's lifecycle state.
 func (s *Server) ReportTaskStatus(args *api.ReportTaskStatusRequest, reply *api.ReportTaskStatusReply) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ref, ok := s.taskRunIndex[args.TaskRunID]
-	if !ok {
-		return fmt.Errorf("unknown task run ID: %s", args.TaskRunID)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
 	}
-	ref.task.Status = args.Status
-	s.runs[ref.runID].Status = computeRunStatus(s.runs[ref.runID].Tasks)
-	return nil
+	defer tx.Rollback()
+
+	var runID string
+	err = tx.QueryRow(`SELECT run_id FROM tasks WHERE task_run_id = ?`, args.TaskRunID).Scan(&runID)
+	if err == sql.ErrNoRows {
+		// Task was rescheduled; silently ignore stale status reports.
+		return tx.Commit()
+	}
+	if err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`UPDATE tasks SET status = ? WHERE task_run_id = ?`,
+		int(args.Status), args.TaskRunID); err != nil {
+		return err
+	}
+	if err := updateRunStatus(tx, runID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // GetRunStatus returns the current lifecycle state of a run.
 func (s *Server) GetRunStatus(args *api.GetRunStatusRequest, reply *api.GetRunStatusReply) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	run, ok := s.runs[args.RunID]
-	if !ok {
+	var status int
+	err := s.db.QueryRow(`SELECT status FROM runs WHERE run_id = ?`, args.RunID).Scan(&status)
+	if err == sql.ErrNoRows {
 		return fmt.Errorf("unknown run ID: %s", args.RunID)
 	}
-	reply.Status = run.Status
+	if err != nil {
+		return err
+	}
+	reply.Status = api.RunStatus(status)
 	return nil
 }
 
-// GetCommand returns and clears the pending command queue for a machine.
+// GetCommand retrieves and clears the pending command queue for a machine.
+// It reads all commands into memory, parses them, then deletes and commits on success.
 func (s *Server) GetCommand(args *api.GetCommandRequest, reply *api.GetCommandReply) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.machines[args.MachineID]; !ok {
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM machines WHERE id = ?`, args.MachineID).Scan(&count); err != nil {
+		return err
+	}
+	if count == 0 {
 		return fmt.Errorf("unknown machine: %s", args.MachineID)
 	}
-	reply.Commands = s.machineQueues[args.MachineID]
-	s.machineQueues[args.MachineID] = nil
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`SELECT id, type, payload_json FROM commands WHERE machine_id = ? ORDER BY id`, args.MachineID)
+	if err != nil {
+		return err
+	}
+	type dbRow struct {
+		id      int64
+		cmdType string
+		payload string
+	}
+	var dbRows []dbRow
+	for rows.Next() {
+		var r dbRow
+		if err := rows.Scan(&r.id, &r.cmdType, &r.payload); err != nil {
+			rows.Close()
+			return err
+		}
+		dbRows = append(dbRows, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Parse all commands; roll back if any are malformed.
+	cmds := make([]api.Command, 0, len(dbRows))
+	for _, r := range dbRows {
+		cmd, err := parseCommand(r.cmdType, r.payload)
+		if err != nil {
+			return err
+		}
+		cmds = append(cmds, cmd)
+	}
+
+	// Parsing succeeded — delete and commit.
+	for _, r := range dbRows {
+		if _, err := tx.Exec(`DELETE FROM commands WHERE id = ?`, r.id); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	reply.Commands = cmds
 	return nil
 }
 
 // PullFiles enqueues SendFile commands for the relevant task(s) and returns a request ID.
 func (s *Server) PullFiles(args *api.PullFilesRequest, reply *api.PullFilesReply) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	run, ok := s.runs[args.RunID]
-	if !ok {
+	var exists int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM runs WHERE run_id = ?`, args.RunID).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
 		return fmt.Errorf("unknown run ID: %s", args.RunID)
 	}
 
-	tasks := run.Tasks
+	var query string
+	var queryArgs []any
 	if args.TaskNumber >= 0 {
-		var found *taskRecord
-		for _, t := range tasks {
-			if t.TaskNumber == args.TaskNumber {
-				found = t
-				break
-			}
+		query = `SELECT task_run_id, task_number, machine_id FROM tasks WHERE run_id = ? AND task_number = ? AND machine_id IS NOT NULL`
+		queryArgs = []any{args.RunID, args.TaskNumber}
+	} else {
+		query = `SELECT task_run_id, task_number, machine_id FROM tasks WHERE run_id = ? AND machine_id IS NOT NULL`
+		queryArgs = []any{args.RunID}
+	}
+
+	rows, err := s.db.Query(query, queryArgs...)
+	if err != nil {
+		return err
+	}
+	type task struct {
+		taskRunID  string
+		taskNumber int
+		machineID  string
+	}
+	var tasks []task
+	for rows.Next() {
+		var t task
+		if err := rows.Scan(&t.taskRunID, &t.taskNumber, &t.machineID); err != nil {
+			rows.Close()
+			return err
 		}
-		if found == nil {
-			return fmt.Errorf("task %d not found in run %s", args.TaskNumber, args.RunID)
-		}
-		tasks = []*taskRecord{found}
+		tasks = append(tasks, t)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if len(tasks) == 0 {
+		return fmt.Errorf("no assigned tasks found for run %s", args.RunID)
 	}
 
 	requestID := uuid.New().String()
-	s.pullRequests[requestID] = &pullState{total: len(tasks)}
 
-	for _, task := range tasks {
-		s.machineQueues[task.MachineID] = append(s.machineQueues[task.MachineID], api.Command{
-			Type: api.CmdSendFile,
-			SendFile: &api.SendFileDetails{
-				RequestID:  requestID,
-				TaskRunID:  task.TaskRunID,
-				TaskNumber: task.TaskNumber,
-				Filename:   args.Filename,
-			},
-		})
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`INSERT INTO pull_requests (request_id, total) VALUES (?, ?)`, requestID, len(tasks)); err != nil {
+		return err
+	}
+	for _, t := range tasks {
+		if err := insertCommand(tx, t.machineID, api.CmdSendFile, &api.SendFileDetails{
+			RequestID:  requestID,
+			TaskRunID:  t.taskRunID,
+			TaskNumber: t.taskNumber,
+			Filename:   args.Filename,
+		}); err != nil {
+			return err
+		}
 	}
 
+	if err := tx.Commit(); err != nil {
+		return err
+	}
 	reply.RequestID = requestID
 	reply.Total = len(tasks)
 	return nil
@@ -353,82 +469,122 @@ func (s *Server) PullFiles(args *api.PullFilesRequest, reply *api.PullFilesReply
 
 // UploadFile is called by a machine to deliver a requested file to the server.
 func (s *Server) UploadFile(args *api.UploadFileRequest, reply *api.UploadFileReply) error {
-	s.mu.Lock()
-	ps, ok := s.pullRequests[args.RequestID]
-	s.mu.Unlock()
-	if !ok {
-		return fmt.Errorf("unknown request ID: %s", args.RequestID)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`INSERT INTO pull_results (request_id, task_number, filename, data, err) VALUES (?, ?, ?, ?, ?)`,
+		args.RequestID, args.TaskNumber, args.Filename, args.Data, args.Err); err != nil {
+		return err
 	}
 
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	ps.received++
-	if args.Err != "" {
-		ps.errors = append(ps.errors, api.PullFileError{TaskNumber: args.TaskNumber, Err: args.Err})
-	} else {
-		ps.results = append(ps.results, pullFileResult{
-			TaskNumber: args.TaskNumber,
-			Filename:   args.Filename,
-			Data:       args.Data,
-		})
+	var total, received int
+	if err := tx.QueryRow(`SELECT total FROM pull_requests WHERE request_id = ?`, args.RequestID).Scan(&total); err != nil {
+		return fmt.Errorf("pull request %s: %w", args.RequestID, err)
 	}
-	if ps.received == ps.total {
-		var err error
-		ps.tarData, err = buildResultTar(ps.results)
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pull_results WHERE request_id = ?`, args.RequestID).Scan(&received); err != nil {
+		return err
+	}
+
+	if received == total {
+		rows, err := tx.Query(`SELECT task_number, filename, data FROM pull_results WHERE request_id = ? AND err = ''`, args.RequestID)
 		if err != nil {
-			return fmt.Errorf("build result tar: %w", err)
+			return err
+		}
+		var results []pullFileResult
+		for rows.Next() {
+			var r pullFileResult
+			if err := rows.Scan(&r.TaskNumber, &r.Filename, &r.Data); err != nil {
+				rows.Close()
+				return err
+			}
+			results = append(results, r)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		tarData, err := buildResultTar(results)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE pull_requests SET tar_data = ? WHERE request_id = ?`, tarData, args.RequestID); err != nil {
+			return err
 		}
 	}
-	return nil
+
+	return tx.Commit()
 }
 
 // GetPullResult returns the current status of a pull request.
 func (s *Server) GetPullResult(args *api.GetPullResultRequest, reply *api.GetPullResultReply) error {
-	s.mu.Lock()
-	ps, ok := s.pullRequests[args.RequestID]
-	s.mu.Unlock()
-	if !ok {
+	var total int
+	var tarData []byte
+	err := s.db.QueryRow(`SELECT total, tar_data FROM pull_requests WHERE request_id = ?`, args.RequestID).Scan(&total, &tarData)
+	if err == sql.ErrNoRows {
 		return fmt.Errorf("unknown request ID: %s", args.RequestID)
 	}
-
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	reply.Received = ps.received
-	reply.Total = ps.total
-	reply.Done = ps.received == ps.total
-	reply.TarData = ps.tarData
-	reply.Errors = ps.errors
-	return nil
-}
-
-// Machines returns a snapshot of all registered machines.
-func (s *Server) Machines() []api.MachineInfo {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]api.MachineInfo, 0, len(s.machines))
-	for _, m := range s.machines {
-		out = append(out, *m)
+	if err != nil {
+		return err
 	}
-	return out
+
+	var received int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM pull_results WHERE request_id = ?`, args.RequestID).Scan(&received); err != nil {
+		return err
+	}
+
+	rows, err := s.db.Query(`SELECT task_number, err FROM pull_results WHERE request_id = ? AND err != ''`, args.RequestID)
+	if err != nil {
+		return err
+	}
+	var errs []api.PullFileError
+	for rows.Next() {
+		var e api.PullFileError
+		if err := rows.Scan(&e.TaskNumber, &e.Err); err != nil {
+			rows.Close()
+			return err
+		}
+		errs = append(errs, e)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	reply.Received = received
+	reply.Total = total
+	reply.Done = received == total
+	reply.TarData = tarData
+	reply.Errors = errs
+	return nil
 }
 
 // Status returns a point-in-time snapshot of the datacenter for display.
 func (s *Server) Status() StatusSnapshot {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	machines := make([]api.MachineInfo, 0, len(s.machines))
-	for _, m := range s.machines {
-		machines = append(machines, *m)
+	var machines []api.MachineInfo
+	if rows, err := s.db.Query(`SELECT id, ram, disk, last_heartbeat FROM machines`); err == nil {
+		for rows.Next() {
+			var m api.MachineInfo
+			var lastBeat int64
+			rows.Scan(&m.ID, &m.Spec.RAM, &m.Spec.Disk, &lastBeat)
+			m.LastHeartbeat = time.Unix(0, lastBeat)
+			machines = append(machines, m)
+		}
+		rows.Close()
 	}
 
 	jobCounts := make(map[string]int)
-	for _, run := range s.runs {
-		for _, task := range run.Tasks {
-			if task.Status == api.TaskRunning {
-				jobCounts[task.MachineID]++
-			}
+	if rows, err := s.db.Query(`SELECT machine_id, COUNT(*) FROM tasks WHERE status = ? AND machine_id IS NOT NULL GROUP BY machine_id`, int(api.TaskRunning)); err == nil {
+		for rows.Next() {
+			var machineID string
+			var count int
+			rows.Scan(&machineID, &count)
+			jobCounts[machineID] = count
 		}
+		rows.Close()
 	}
 
 	entries, _ := os.ReadDir(s.cfg.PackageDir)
@@ -436,18 +592,26 @@ func (s *Server) Status() StatusSnapshot {
 	for _, e := range entries {
 		if strings.HasSuffix(e.Name(), ".tar") {
 			hash := strings.TrimSuffix(e.Name(), ".tar")
-			packages = append(packages, PackageInfo{Name: s.packageNames[hash], Hash: hash})
+			var name string
+			s.db.QueryRow(`SELECT name FROM package_names WHERE hash = ?`, hash).Scan(&name)
+			packages = append(packages, PackageInfo{Name: name, Hash: hash})
 		}
 	}
 
-	runs := make([]RunSummary, 0, len(s.runs))
-	for _, run := range s.runs {
-		runs = append(runs, RunSummary{
-			RunID:    run.RunID,
-			JobName:  run.JobName,
-			Status:   run.Status,
-			Replicas: len(run.Tasks),
-		})
+	var runs []RunSummary
+	rows, err := s.db.Query(`
+		SELECT r.run_id, r.job_name, r.status, COUNT(t.task_run_id)
+		FROM runs r LEFT JOIN tasks t ON r.run_id = t.run_id
+		GROUP BY r.run_id`)
+	if err == nil {
+		for rows.Next() {
+			var r RunSummary
+			var status int
+			rows.Scan(&r.RunID, &r.JobName, &status, &r.Replicas)
+			r.Status = api.RunStatus(status)
+			runs = append(runs, r)
+		}
+		rows.Close()
 	}
 
 	return StatusSnapshot{
@@ -475,119 +639,82 @@ func (s *Server) packagePath(hash string) string {
 	return filepath.Join(s.cfg.PackageDir, hash+".tar")
 }
 
-// RunLostDetection periodically marks machines whose heartbeat has exceeded
-// heartbeatTimeout as lost, marks their tasks Lost, and attempts to reschedule
-// those tasks on healthy machines. It runs until the process exits.
-func (s *Server) RunLostDetection(checkInterval, heartbeatTimeout time.Duration) {
-	for {
-		time.Sleep(checkInterval)
-		s.mu.Lock()
-		now := time.Now()
-		for id, m := range s.machines {
-			if now.Sub(m.LastHeartbeat) > heartbeatTimeout {
-				s.handleLostMachine(id)
-			}
-		}
-		s.rescheduleLostTasks()
-		s.mu.Unlock()
+// updateRunStatus recomputes and stores the run's aggregate status from its tasks.
+// Must be called within a transaction.
+func updateRunStatus(tx *sql.Tx, runID string) error {
+	rows, err := tx.Query(`SELECT status FROM tasks WHERE run_id = ?`, runID)
+	if err != nil {
+		return err
 	}
+	var statuses []api.TaskStatus
+	for rows.Next() {
+		var s int
+		rows.Scan(&s)
+		statuses = append(statuses, api.TaskStatus(s))
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	status := computeRunStatus(statuses)
+	_, err = tx.Exec(`UPDATE runs SET status = ? WHERE run_id = ?`, int(status), runID)
+	return err
 }
 
-// handleLostMachine removes the machine and marks its active tasks as Lost.
-// Must be called with s.mu held.
-func (s *Server) handleLostMachine(machineID string) {
-	delete(s.machines, machineID)
-	delete(s.machineQueues, machineID)
-	for _, run := range s.runs {
-		changed := false
-		for _, task := range run.Tasks {
-			if task.MachineID != machineID {
-				continue
-			}
-			switch task.Status {
-			case api.TaskPending, api.TaskFetching, api.TaskRunning:
-				task.Status = api.TaskLost
-				changed = true
-			}
-		}
-		if changed {
-			run.Status = computeRunStatus(run.Tasks)
-		}
-	}
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
 }
 
-// rescheduleLostTasks tries to assign any Lost tasks to a healthy machine.
-// Must be called with s.mu held.
-func (s *Server) rescheduleLostTasks() {
-	for _, run := range s.runs {
-		changed := false
-		for _, task := range run.Tasks {
-			if task.Status == api.TaskLost && s.rescheduleTask(task, run) {
-				changed = true
-			}
-		}
-		if changed {
-			run.Status = computeRunStatus(run.Tasks)
-		}
+// insertCommand marshals payload as JSON and inserts a command row.
+func insertCommand(db execer, machineID string, cmdType api.CommandType, payload any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
 	}
+	_, err = db.Exec(`INSERT INTO commands (machine_id, type, payload_json) VALUES (?, ?, ?)`,
+		machineID, string(cmdType), string(data))
+	return err
 }
 
-// rescheduleTask assigns a Lost task to a new eligible machine, returning true
-// on success. Must be called with s.mu held.
-func (s *Server) rescheduleTask(task *taskRecord, run *runRecord) bool {
-	needRAM := uint64(run.Spec.Requirements.RAM)
-	needDisk := uint64(run.Spec.Requirements.Disk)
-	var eligible []string
-	for id, m := range s.machines {
-		if m.Spec.RAM >= needRAM && m.Spec.Disk >= needDisk {
-			eligible = append(eligible, id)
+// parseCommand deserializes a command from its DB representation.
+func parseCommand(cmdType, payloadJSON string) (api.Command, error) {
+	cmd := api.Command{Type: api.CommandType(cmdType)}
+	switch cmd.Type {
+	case api.CmdFetchPackage:
+		var d api.FetchPackageDetails
+		if err := json.Unmarshal([]byte(payloadJSON), &d); err != nil {
+			return cmd, err
 		}
+		cmd.FetchPackage = &d
+	case api.CmdRunBinary:
+		var d api.RunBinaryDetails
+		if err := json.Unmarshal([]byte(payloadJSON), &d); err != nil {
+			return cmd, err
+		}
+		cmd.RunBinary = &d
+	case api.CmdSendFile:
+		var d api.SendFileDetails
+		if err := json.Unmarshal([]byte(payloadJSON), &d); err != nil {
+			return cmd, err
+		}
+		cmd.SendFile = &d
+	case api.CmdCancelTask:
+		var d api.CancelTaskDetails
+		if err := json.Unmarshal([]byte(payloadJSON), &d); err != nil {
+			return cmd, err
+		}
+		cmd.CancelTask = &d
+	default:
+		return cmd, fmt.Errorf("unknown command type: %s", cmdType)
 	}
-	if len(eligible) == 0 {
-		return false
-	}
-	machineID := eligible[0]
-	newTaskRunID := uuid.New().String()
-
-	delete(s.taskRunIndex, task.TaskRunID)
-	task.MachineID = machineID
-	task.TaskRunID = newTaskRunID
-	task.Status = api.TaskPending
-	s.taskRunIndex[newTaskRunID] = taskRunRef{task: task, runID: run.RunID}
-
-	for _, pkg := range run.Spec.Packages {
-		s.machineQueues[machineID] = append(s.machineQueues[machineID], api.Command{
-			Type: api.CmdFetchPackage,
-			FetchPackage: &api.FetchPackageDetails{
-				PackageName: pkg.Name,
-				PackageHash: run.PackageHashes[pkg.Name],
-			},
-		})
-	}
-	s.machineQueues[machineID] = append(s.machineQueues[machineID], api.Command{
-		Type: api.CmdRunBinary,
-		RunBinary: &api.RunBinaryDetails{
-			RunID:       newTaskRunID,
-			PackageName: run.Spec.Binary.Package,
-			BinaryPath:  run.Spec.Binary.Path,
-			Args:        expandArgs(run.Spec.Args, task.TaskNumber),
-		},
-	})
-	return true
+	return cmd, nil
 }
 
-func expandArgs(args []string, taskNumber int) []string {
-	out := make([]string, len(args))
-	for i, a := range args {
-		out[i] = strings.ReplaceAll(a, "%TASKID%", strconv.Itoa(taskNumber))
-	}
-	return out
-}
-
-func computeRunStatus(tasks []*taskRecord) api.RunStatus {
+func computeRunStatus(statuses []api.TaskStatus) api.RunStatus {
 	var running, pending, fetching, complete, failed, lost, cancelled int
-	for _, t := range tasks {
-		switch t.Status {
+	for _, s := range statuses {
+		switch s {
 		case api.TaskRunning:
 			running++
 		case api.TaskPending:
@@ -604,7 +731,7 @@ func computeRunStatus(tasks []*taskRecord) api.RunStatus {
 			cancelled++
 		}
 	}
-	total := len(tasks)
+	total := len(statuses)
 	switch {
 	case running > 0:
 		return api.RunRunning
@@ -620,6 +747,14 @@ func computeRunStatus(tasks []*taskRecord) api.RunStatus {
 	default:
 		return api.RunFailed
 	}
+}
+
+func expandArgs(args []string, taskNumber int) []string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		out[i] = strings.ReplaceAll(a, "%TASKID%", strconv.Itoa(taskNumber))
+	}
+	return out
 }
 
 func buildResultTar(results []pullFileResult) ([]byte, error) {

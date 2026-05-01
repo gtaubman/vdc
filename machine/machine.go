@@ -41,7 +41,7 @@ type Machine struct {
 // Join connects to the leader, registers this machine, and creates a basedir
 // for job execution. It retries every second until the server is reachable.
 func Join(host string, port int, spec api.MachineSpec) (*Machine, error) {
-	c, id := dialAndRegister(host, port, spec, nil)
+	c, id := dialAndRegister(host, port, "", spec, nil)
 
 	baseDir, err := os.MkdirTemp("", "vdc-machine-*")
 	if err != nil {
@@ -62,8 +62,9 @@ func Join(host string, port int, spec api.MachineSpec) (*Machine, error) {
 }
 
 // dialAndRegister retries dial+register every second until both succeed.
-// activeTaskIDs reports tasks the machine believes are still running (for reconnects).
-func dialAndRegister(host string, port int, spec api.MachineSpec, activeTaskIDs []string) (*client.Client, string) {
+// machineID is the machine's existing ID to reclaim on reconnect, or "" on first join.
+// activeTaskIDs reports tasks the machine believes are still running.
+func dialAndRegister(host string, port int, machineID string, spec api.MachineSpec, activeTaskIDs []string) (*client.Client, string) {
 	for {
 		c, err := client.Dial(host, port)
 		if err != nil {
@@ -71,7 +72,7 @@ func dialAndRegister(host string, port int, spec api.MachineSpec, activeTaskIDs 
 			time.Sleep(1 * time.Second)
 			continue
 		}
-		id, err := c.RegisterMachine(spec, activeTaskIDs)
+		id, err := c.RegisterMachine(machineID, spec, activeTaskIDs)
 		if err != nil {
 			c.Close()
 			fmt.Fprintf(os.Stderr, "vdc: register: %v\n", err)
@@ -114,7 +115,7 @@ func (m *Machine) maybeReconnect(epoch int) {
 		return
 	}
 
-	c, id := dialAndRegister(m.host, m.port, m.Spec, m.activeTaskIDs())
+	c, id := dialAndRegister(m.host, m.port, m.ID, m.Spec, m.activeTaskIDs())
 
 	m.mu.Lock()
 	old := m.client

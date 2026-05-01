@@ -11,11 +11,12 @@ import (
 func cmdLeader(args []string) {
 	fs := flag.NewFlagSet("leader", flag.ExitOnError)
 	port := fs.Int("port", 8080, "port to listen on")
-	packageDir := fs.String("package_dir", "", "directory to store packages (default: temp dir)")
+	packageDir := fs.String("package_dir", "vdc-packages", "directory to store packages")
+	dbPath := fs.String("db", "vdc-leader.db", "SQLite database path")
 	heartbeatTimeout := fs.Duration("heartbeat_timeout", 30*time.Second, "time before a silent machine is considered lost")
 	fs.Parse(args)
 
-	srv, err := server.New(server.Config{PackageDir: *packageDir})
+	srv, err := server.New(server.Config{PackageDir: *packageDir, DBPath: *dbPath})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "server init: %v\n", err)
 		os.Exit(1)
@@ -27,7 +28,7 @@ func cmdLeader(args []string) {
 			os.Exit(1)
 		}
 	}()
-	go srv.RunLostDetection(5*time.Second, *heartbeatTimeout)
+	go srv.RunLoop(*heartbeatTimeout, 60*time.Second)
 
 	fmt.Printf("VDC leader listening on :%d  (packages: %s)\n", *port, srv.PackageDir())
 	printStatus(srv)

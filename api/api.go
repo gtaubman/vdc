@@ -21,6 +21,7 @@ type MachineInfo struct {
 
 // RegisterRequest is the argument to the RegisterMachine RPC.
 type RegisterRequest struct {
+	MachineID     string   // if non-empty, reuse this ID (reconnect after server restart)
 	Spec          MachineSpec
 	ActiveTaskIDs []string // task run IDs the machine was executing before reconnecting
 }

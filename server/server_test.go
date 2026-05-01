@@ -7,78 +7,116 @@ import (
 	"vdc/jobspec"
 )
 
+func newTestServer(t *testing.T) *Server {
+	t.Helper()
+	srv, err := New(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv
+}
+
+func mustRegister(t *testing.T, srv *Server, spec api.MachineSpec) string {
+	t.Helper()
+	reply := &api.RegisterReply{}
+	if err := srv.RegisterMachine(&api.RegisterRequest{Spec: spec}, reply); err != nil {
+		t.Fatal(err)
+	}
+	return reply.MachineID
+}
+
+func mustSubmit(t *testing.T, srv *Server, spec jobspec.JobSpec) string {
+	t.Helper()
+	hashes := make(map[string]string, len(spec.Packages))
+	for _, pkg := range spec.Packages {
+		hashes[pkg.Name] = pkg.Name + "-hash"
+	}
+	reply := &api.SubmitJobReply{}
+	if err := srv.SubmitJob(&api.SubmitJobRequest{Spec: spec, PackageHashes: hashes}, reply); err != nil {
+		t.Fatal(err)
+	}
+	return reply.RunID
+}
+
+func mustGetCommand(t *testing.T, srv *Server, machineID string) []api.Command {
+	t.Helper()
+	reply := &api.GetCommandReply{}
+	if err := srv.GetCommand(&api.GetCommandRequest{MachineID: machineID}, reply); err != nil {
+		t.Fatal(err)
+	}
+	return reply.Commands
+}
+
 func TestComputeRunStatus(t *testing.T) {
 	tests := []struct {
-		name  string
-		tasks []*taskRecord
-		want  api.RunStatus
+		name     string
+		statuses []api.TaskStatus
+		want     api.RunStatus
 	}{
 		{
 			"all pending",
-			[]*taskRecord{{Status: api.TaskPending}, {Status: api.TaskPending}},
+			[]api.TaskStatus{api.TaskPending, api.TaskPending},
 			api.RunPending,
 		},
 		{
 			"fetching counts as pending",
-			[]*taskRecord{{Status: api.TaskFetching}, {Status: api.TaskPending}},
+			[]api.TaskStatus{api.TaskFetching, api.TaskPending},
 			api.RunPending,
 		},
 		{
 			"running beats pending",
-			[]*taskRecord{{Status: api.TaskRunning}, {Status: api.TaskPending}},
+			[]api.TaskStatus{api.TaskRunning, api.TaskPending},
 			api.RunRunning,
 		},
 		{
 			"all complete",
-			[]*taskRecord{{Status: api.TaskComplete}, {Status: api.TaskComplete}},
+			[]api.TaskStatus{api.TaskComplete, api.TaskComplete},
 			api.RunComplete,
 		},
 		{
 			"all cancelled",
-			[]*taskRecord{{Status: api.TaskCancelled}, {Status: api.TaskCancelled}},
+			[]api.TaskStatus{api.TaskCancelled, api.TaskCancelled},
 			api.RunCancelled,
 		},
 		{
 			"some complete some failed is partial failure",
-			[]*taskRecord{{Status: api.TaskComplete}, {Status: api.TaskFailed}, {Status: api.TaskComplete}},
+			[]api.TaskStatus{api.TaskComplete, api.TaskFailed, api.TaskComplete},
 			api.RunPartialFailure,
 		},
 		{
 			"all failed",
-			[]*taskRecord{{Status: api.TaskFailed}, {Status: api.TaskFailed}},
+			[]api.TaskStatus{api.TaskFailed, api.TaskFailed},
 			api.RunFailed,
 		},
 		{
 			"running beats failed",
-			[]*taskRecord{{Status: api.TaskRunning}, {Status: api.TaskFailed}},
+			[]api.TaskStatus{api.TaskRunning, api.TaskFailed},
 			api.RunRunning,
 		},
 		{
 			"pending beats failed",
-			[]*taskRecord{{Status: api.TaskPending}, {Status: api.TaskFailed}},
+			[]api.TaskStatus{api.TaskPending, api.TaskFailed},
 			api.RunPending,
 		},
 		{
 			"lost counts as pending (awaiting reschedule)",
-			[]*taskRecord{{Status: api.TaskLost}, {Status: api.TaskComplete}},
+			[]api.TaskStatus{api.TaskLost, api.TaskComplete},
 			api.RunPending,
 		},
 		{
 			"all lost",
-			[]*taskRecord{{Status: api.TaskLost}, {Status: api.TaskLost}},
+			[]api.TaskStatus{api.TaskLost, api.TaskLost},
 			api.RunPending,
 		},
 		{
-			"some complete some lost is partial failure once rescheduled tasks finish",
-			// This state is reached after lost tasks fail their reschedule attempt.
-			// For now lost still shows as pending since they may be rescheduled.
-			[]*taskRecord{{Status: api.TaskComplete}, {Status: api.TaskLost}},
+			"some complete some lost is pending since they may be rescheduled",
+			[]api.TaskStatus{api.TaskComplete, api.TaskLost},
 			api.RunPending,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := computeRunStatus(tt.tasks)
+			got := computeRunStatus(tt.statuses)
 			if got != tt.want {
 				t.Errorf("computeRunStatus() = %q, want %q", got, tt.want)
 			}
@@ -86,43 +124,26 @@ func TestComputeRunStatus(t *testing.T) {
 	}
 }
 
-func TestServerEnqueuesOneRunBinaryPerReplica(t *testing.T) {
-	srv, err := New(Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	regReply := &api.RegisterReply{}
-	if err := srv.RegisterMachine(&api.RegisterRequest{
-		Spec: api.MachineSpec{RAM: 1 << 30, Disk: 10 << 30},
-	}, regReply); err != nil {
-		t.Fatal(err)
-	}
-	machineID := regReply.MachineID
+func TestSubmitJobScheduledByLoop(t *testing.T) {
+	srv := newTestServer(t)
+	machineID := mustRegister(t, srv, api.MachineSpec{RAM: 1 << 30, Disk: 10 << 30})
 
 	spec := jobspec.JobSpec{
-		Name: "test-job",
-		Packages: []jobspec.Package{
-			{Name: "mypkg", Files: []string{"somefile"}},
-		},
-		Binary: jobspec.Binary{Package: "mypkg", Path: "bin"},
+		Name:     "test-job",
+		Packages: []jobspec.Package{{Name: "mypkg", Files: []string{"somefile"}}},
+		Binary:   jobspec.Binary{Package: "mypkg", Path: "bin"},
 		Requirements: jobspec.Requirements{
 			RAM:  bytesize.ByteSize(64 << 20),
 			Disk: bytesize.ByteSize(64 << 20),
 		},
 		Replicas: 3,
 	}
+	mustSubmit(t, srv, spec)
+	srv.scheduleNewRuns()
 
-	submitReply := &api.SubmitJobReply{}
-	if err := srv.SubmitJob(&api.SubmitJobRequest{
-		Spec:          spec,
-		PackageHashes: map[string]string{"mypkg": "abc123hash"},
-	}, submitReply); err != nil {
-		t.Fatal(err)
-	}
-
+	cmds := mustGetCommand(t, srv, machineID)
 	var runCount int
-	for _, cmd := range srv.machineQueues[machineID] {
+	for _, cmd := range cmds {
 		if cmd.Type == api.CmdRunBinary {
 			runCount++
 		}
@@ -133,24 +154,9 @@ func TestServerEnqueuesOneRunBinaryPerReplica(t *testing.T) {
 }
 
 func TestLostTaskRescheduledOnNewMachine(t *testing.T) {
-	srv, err := New(Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Register two machines; first gets the job, then goes lost.
-	reg1 := &api.RegisterReply{}
-	if err := srv.RegisterMachine(&api.RegisterRequest{
-		Spec: api.MachineSpec{RAM: 1 << 30, Disk: 10 << 30},
-	}, reg1); err != nil {
-		t.Fatal(err)
-	}
-	reg2 := &api.RegisterReply{}
-	if err := srv.RegisterMachine(&api.RegisterRequest{
-		Spec: api.MachineSpec{RAM: 1 << 30, Disk: 10 << 30},
-	}, reg2); err != nil {
-		t.Fatal(err)
-	}
+	srv := newTestServer(t)
+	m1 := mustRegister(t, srv, api.MachineSpec{RAM: 1 << 30, Disk: 10 << 30})
+	m2 := mustRegister(t, srv, api.MachineSpec{RAM: 1 << 30, Disk: 10 << 30})
 
 	spec := jobspec.JobSpec{
 		Name:     "test-job",
@@ -162,53 +168,42 @@ func TestLostTaskRescheduledOnNewMachine(t *testing.T) {
 		},
 		Replicas: 1,
 	}
-	submitReply := &api.SubmitJobReply{}
-	if err := srv.SubmitJob(&api.SubmitJobRequest{
-		Spec:          spec,
-		PackageHashes: map[string]string{"pkg": "hash1"},
-	}, submitReply); err != nil {
+	runID := mustSubmit(t, srv, spec)
+	srv.scheduleNewRuns()
+
+	var originalMachine, originalTaskRunID string
+	srv.db.QueryRow(`SELECT machine_id, task_run_id FROM tasks WHERE run_id = ?`, runID).
+		Scan(&originalMachine, &originalTaskRunID)
+
+	if err := srv.handleLostMachine(originalMachine); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.rescheduleLostTasks(); err != nil {
 		t.Fatal(err)
 	}
 
-	// Find which machine got the task.
-	srv.mu.Lock()
-	run := srv.runs[submitReply.RunID]
-	task := run.Tasks[0]
-	originalMachine := task.MachineID
-	originalTaskRunID := task.TaskRunID
-	srv.mu.Unlock()
+	var newMachine, newTaskRunID string
+	var taskStatus int
+	srv.db.QueryRow(`SELECT machine_id, task_run_id, status FROM tasks WHERE run_id = ?`, runID).
+		Scan(&newMachine, &newTaskRunID, &taskStatus)
 
-	// Simulate the machine going lost.
-	srv.mu.Lock()
-	srv.handleLostMachine(originalMachine)
-	srv.mu.Unlock()
-
-	if task.Status != api.TaskLost {
-		t.Fatalf("task status = %v, want Lost", task.Status)
+	if api.TaskStatus(taskStatus) != api.TaskPending {
+		t.Errorf("task status = %v, want Pending", api.TaskStatus(taskStatus))
 	}
-
-	// Reschedule onto the surviving machine.
-	srv.mu.Lock()
-	srv.rescheduleLostTasks()
-	srv.mu.Unlock()
-
-	if task.Status != api.TaskPending {
-		t.Fatalf("task status after reschedule = %v, want Pending", task.Status)
-	}
-	if task.TaskRunID == originalTaskRunID {
+	if newTaskRunID == originalTaskRunID {
 		t.Error("task run ID was not updated after reschedule")
 	}
-	otherMachine := reg1.MachineID
-	if originalMachine == reg1.MachineID {
-		otherMachine = reg2.MachineID
+
+	otherMachine := m2
+	if originalMachine == m2 {
+		otherMachine = m1
 	}
-	if task.MachineID != otherMachine {
-		t.Errorf("task assigned to %q, want %q", task.MachineID, otherMachine)
+	if newMachine != otherMachine {
+		t.Errorf("task assigned to %q, want %q", newMachine, otherMachine)
 	}
 
-	// The surviving machine should have received FetchPackage + RunBinary.
 	var fetchCount, runCount int
-	for _, cmd := range srv.machineQueues[otherMachine] {
+	for _, cmd := range mustGetCommand(t, srv, otherMachine) {
 		switch cmd.Type {
 		case api.CmdFetchPackage:
 			fetchCount++
@@ -222,23 +217,9 @@ func TestLostTaskRescheduledOnNewMachine(t *testing.T) {
 }
 
 func TestReconnectingMachineGetsCancelForRescheduledTask(t *testing.T) {
-	srv, err := New(Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	reg1 := &api.RegisterReply{}
-	if err := srv.RegisterMachine(&api.RegisterRequest{
-		Spec: api.MachineSpec{RAM: 1 << 30, Disk: 10 << 30},
-	}, reg1); err != nil {
-		t.Fatal(err)
-	}
-	reg2 := &api.RegisterReply{}
-	if err := srv.RegisterMachine(&api.RegisterRequest{
-		Spec: api.MachineSpec{RAM: 1 << 30, Disk: 10 << 30},
-	}, reg2); err != nil {
-		t.Fatal(err)
-	}
+	srv := newTestServer(t)
+	mustRegister(t, srv, api.MachineSpec{RAM: 1 << 30, Disk: 10 << 30})
+	mustRegister(t, srv, api.MachineSpec{RAM: 1 << 30, Disk: 10 << 30})
 
 	spec := jobspec.JobSpec{
 		Name:     "cancel-test",
@@ -250,22 +231,19 @@ func TestReconnectingMachineGetsCancelForRescheduledTask(t *testing.T) {
 		},
 		Replicas: 1,
 	}
-	submitReply := &api.SubmitJobReply{}
-	if err := srv.SubmitJob(&api.SubmitJobRequest{
-		Spec:          spec,
-		PackageHashes: map[string]string{"pkg": "hash1"},
-	}, submitReply); err != nil {
+	runID := mustSubmit(t, srv, spec)
+	srv.scheduleNewRuns()
+
+	var originalMachine, oldTaskRunID string
+	srv.db.QueryRow(`SELECT machine_id, task_run_id FROM tasks WHERE run_id = ?`, runID).
+		Scan(&originalMachine, &oldTaskRunID)
+
+	if err := srv.handleLostMachine(originalMachine); err != nil {
 		t.Fatal(err)
 	}
-
-	srv.mu.Lock()
-	run := srv.runs[submitReply.RunID]
-	task := run.Tasks[0]
-	originalMachine := task.MachineID
-	oldTaskRunID := task.TaskRunID
-	srv.handleLostMachine(originalMachine)
-	srv.rescheduleLostTasks()
-	srv.mu.Unlock()
+	if err := srv.rescheduleLostTasks(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Original machine reconnects and reports the old task run ID.
 	reconnectReply := &api.RegisterReply{}
@@ -276,9 +254,8 @@ func TestReconnectingMachineGetsCancelForRescheduledTask(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Its queue should contain a CancelTask for the old run ID.
 	var found bool
-	for _, cmd := range srv.machineQueues[reconnectReply.MachineID] {
+	for _, cmd := range mustGetCommand(t, srv, reconnectReply.MachineID) {
 		if cmd.Type == api.CmdCancelTask && cmd.CancelTask.RunID == oldTaskRunID {
 			found = true
 		}

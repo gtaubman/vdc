@@ -22,10 +22,10 @@ func Dial(host string, port int) (*Client, error) {
 }
 
 // RegisterMachine registers this machine with the leader.
-// activeTaskIDs should list any task run IDs the machine was executing before
-// a disconnect; pass nil on first join.
-func (c *Client) RegisterMachine(spec api.MachineSpec, activeTaskIDs []string) (string, error) {
-	args := &api.RegisterRequest{Spec: spec, ActiveTaskIDs: activeTaskIDs}
+// machineID should be the machine's existing ID on reconnect, or "" on first join.
+// activeTaskIDs should list any task run IDs the machine was executing before a disconnect.
+func (c *Client) RegisterMachine(machineID string, spec api.MachineSpec, activeTaskIDs []string) (string, error) {
+	args := &api.RegisterRequest{MachineID: machineID, Spec: spec, ActiveTaskIDs: activeTaskIDs}
 	reply := &api.RegisterReply{}
 	if err := c.rpc.Call("Server.RegisterMachine", args, reply); err != nil {
 		return "", err
