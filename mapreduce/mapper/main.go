@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -36,6 +37,8 @@ func main() {
 		os.Exit(1)
 	}
 	defer f.Close()
+
+	time.Sleep(5 * time.Second)
 
 	counts := make(map[string]int)
 	scanner := bufio.NewScanner(f)

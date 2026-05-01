@@ -669,6 +669,18 @@ func (s *Server) packagePath(hash string) string {
 // updateRunStatus recomputes and stores the run's aggregate status from its tasks.
 // Must be called within a transaction.
 func updateRunStatus(tx *sql.Tx, runID string) error {
+	// RunScheduling is exclusively managed by the scheduler (tryScheduleRun /
+	// rescheduleTask). Status reports and lost-machine handling must not
+	// interfere with it; any unscheduled tasks will be picked up on the next
+	// scheduling tick.
+	var currentStatus int
+	if err := tx.QueryRow(`SELECT status FROM runs WHERE run_id = ?`, runID).Scan(&currentStatus); err != nil {
+		return err
+	}
+	if api.RunStatus(currentStatus) == api.RunScheduling {
+		return nil
+	}
+
 	rows, err := tx.Query(`SELECT status FROM tasks WHERE run_id = ?`, runID)
 	if err != nil {
 		return err
