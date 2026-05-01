@@ -573,6 +573,11 @@
     return pad2(Math.floor(sec / 3600)) + ':' + pad2(Math.floor((sec % 3600) / 60)) + ':' + pad2(sec % 60);
   }
 
+  // Format a Date as a local HH:MM:SS timestamp
+  function fmtTimestamp(d) {
+    return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+  }
+
   // Returns null for Go zero-time ("0001-01-01...")
   function parseTime(isoStr) {
     if (!isoStr) return null;
@@ -851,7 +856,7 @@
         var tFinished = parseTime(t.FinishedAt);
 
         var startedHtml  = tStarted
-          ? '<span class="mono">' + fmtDur(Math.floor((now - tStarted) / 1000)) + '</span>'
+          ? '<span class="mono">' + fmtTimestamp(tStarted) + '</span>'
           : '<span class="text-muted">—</span>';
 
         var durationHtml = (tStarted && tFinished)
