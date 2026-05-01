@@ -29,6 +29,9 @@ type Machine struct {
 
 	reconnectMu sync.Mutex // serializes reconnect attempts
 
+	activeMu   sync.Mutex
+	activeRuns map[string]*exec.Cmd // task run ID -> running process
+
 	fetchMu sync.Mutex
 	// fetchDone is keyed by package hash. A closed channel means the fetch
 	// completed successfully. A nil entry means not yet started.
@@ -38,7 +41,7 @@ type Machine struct {
 // Join connects to the leader, registers this machine, and creates a basedir
 // for job execution. It retries every second until the server is reachable.
 func Join(host string, port int, spec api.MachineSpec) (*Machine, error) {
-	c, id := dialAndRegister(host, port, spec)
+	c, id := dialAndRegister(host, port, spec, nil)
 
 	baseDir, err := os.MkdirTemp("", "vdc-machine-*")
 	if err != nil {
@@ -47,18 +50,20 @@ func Join(host string, port int, spec api.MachineSpec) (*Machine, error) {
 	}
 
 	return &Machine{
-		ID:        id,
-		BaseDir:   baseDir,
-		Spec:      spec,
-		host:      host,
-		port:      port,
-		client:    c,
-		fetchDone: make(map[string]chan struct{}),
+		ID:         id,
+		BaseDir:    baseDir,
+		Spec:       spec,
+		host:       host,
+		port:       port,
+		client:     c,
+		activeRuns: make(map[string]*exec.Cmd),
+		fetchDone:  make(map[string]chan struct{}),
 	}, nil
 }
 
 // dialAndRegister retries dial+register every second until both succeed.
-func dialAndRegister(host string, port int, spec api.MachineSpec) (*client.Client, string) {
+// activeTaskIDs reports tasks the machine believes are still running (for reconnects).
+func dialAndRegister(host string, port int, spec api.MachineSpec, activeTaskIDs []string) (*client.Client, string) {
 	for {
 		c, err := client.Dial(host, port)
 		if err != nil {
@@ -66,7 +71,7 @@ func dialAndRegister(host string, port int, spec api.MachineSpec) (*client.Clien
 			time.Sleep(1 * time.Second)
 			continue
 		}
-		id, err := c.RegisterMachine(spec)
+		id, err := c.RegisterMachine(spec, activeTaskIDs)
 		if err != nil {
 			c.Close()
 			fmt.Fprintf(os.Stderr, "vdc: register: %v\n", err)
@@ -75,6 +80,17 @@ func dialAndRegister(host string, port int, spec api.MachineSpec) (*client.Clien
 		}
 		return c, id
 	}
+}
+
+// activeTaskIDs returns the run IDs of tasks currently executing on this machine.
+func (m *Machine) activeTaskIDs() []string {
+	m.activeMu.Lock()
+	defer m.activeMu.Unlock()
+	ids := make([]string, 0, len(m.activeRuns))
+	for id := range m.activeRuns {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // conn returns the current client, machine ID, and connection epoch atomically.
@@ -98,7 +114,7 @@ func (m *Machine) maybeReconnect(epoch int) {
 		return
 	}
 
-	c, id := dialAndRegister(m.host, m.port, m.Spec)
+	c, id := dialAndRegister(m.host, m.port, m.Spec, m.activeTaskIDs())
 
 	m.mu.Lock()
 	old := m.client
@@ -159,9 +175,21 @@ func (m *Machine) execute(cmd api.Command) error {
 		return m.runBinary(cmd.RunBinary)
 	case api.CmdSendFile:
 		return m.sendFile(cmd.SendFile)
+	case api.CmdCancelTask:
+		return m.cancelTask(cmd.CancelTask)
 	default:
 		return fmt.Errorf("unknown command type: %s", cmd.Type)
 	}
+}
+
+func (m *Machine) cancelTask(details *api.CancelTaskDetails) error {
+	m.activeMu.Lock()
+	cmd := m.activeRuns[details.RunID]
+	m.activeMu.Unlock()
+	if cmd != nil && cmd.Process != nil {
+		cmd.Process.Kill()
+	}
+	return nil
 }
 
 func (m *Machine) fetchPackage(details *api.FetchPackageDetails) error {
@@ -224,7 +252,21 @@ func (m *Machine) runBinary(details *api.RunBinaryDetails) error {
 	cmd := exec.Command(binaryPath, details.Args...)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	runErr := cmd.Run()
+
+	if err := cmd.Start(); err != nil {
+		_ = c.ReportTaskStatus(details.RunID, api.TaskFailed)
+		return fmt.Errorf("start binary: %w", err)
+	}
+
+	m.activeMu.Lock()
+	m.activeRuns[details.RunID] = cmd
+	m.activeMu.Unlock()
+
+	runErr := cmd.Wait()
+
+	m.activeMu.Lock()
+	delete(m.activeRuns, details.RunID)
+	m.activeMu.Unlock()
 
 	status := api.TaskComplete
 	if runErr != nil {

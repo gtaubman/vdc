@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 	"vdc/api"
+	"vdc/jobspec"
 
 	"github.com/google/uuid"
 )
@@ -37,10 +38,12 @@ type taskRunRef struct {
 }
 
 type runRecord struct {
-	RunID   string
-	JobName string
-	Tasks   []*taskRecord
-	Status  api.RunStatus
+	RunID         string
+	JobName       string
+	Spec          jobspec.JobSpec
+	PackageHashes map[string]string
+	Tasks         []*taskRecord
+	Status        api.RunStatus
 }
 
 // RunSummary is a brief description of a run for the status display.
@@ -116,6 +119,9 @@ func New(cfg Config) (*Server, error) {
 func (s *Server) PackageDir() string { return s.cfg.PackageDir }
 
 // RegisterMachine registers a new machine with the datacenter.
+// If the machine reports ActiveTaskIDs from a previous connection, cancelled
+// tasks (those rescheduled elsewhere) receive a CancelTask command; Lost tasks
+// that were not rescheduled are reactivated under the new machine ID.
 func (s *Server) RegisterMachine(args *api.RegisterRequest, reply *api.RegisterReply) error {
 	id := uuid.New().String()
 	s.mu.Lock()
@@ -125,6 +131,25 @@ func (s *Server) RegisterMachine(args *api.RegisterRequest, reply *api.RegisterR
 		LastHeartbeat: time.Now(),
 	}
 	s.machineQueues[id] = nil
+
+	for _, taskRunID := range args.ActiveTaskIDs {
+		ref, ok := s.taskRunIndex[taskRunID]
+		if !ok {
+			// Task was rescheduled to another machine — cancel it here.
+			s.machineQueues[id] = append(s.machineQueues[id], api.Command{
+				Type:       api.CmdCancelTask,
+				CancelTask: &api.CancelTaskDetails{RunID: taskRunID},
+			})
+			continue
+		}
+		if ref.task.Status == api.TaskLost {
+			// Couldn't reschedule (no other machines); machine is back, reactivate.
+			ref.task.MachineID = id
+			ref.task.Status = api.TaskRunning
+			s.runs[ref.runID].Status = computeRunStatus(s.runs[ref.runID].Tasks)
+		}
+	}
+
 	s.mu.Unlock()
 	reply.MachineID = id
 	return nil
@@ -232,10 +257,12 @@ func (s *Server) SubmitJob(args *api.SubmitJobRequest, reply *api.SubmitJobReply
 	}
 
 	s.runs[runID] = &runRecord{
-		RunID:   runID,
-		JobName: spec.Name,
-		Tasks:   tasks,
-		Status:  api.RunPending,
+		RunID:         runID,
+		JobName:       spec.Name,
+		Spec:          spec,
+		PackageHashes: args.PackageHashes,
+		Tasks:         tasks,
+		Status:        api.RunPending,
 	}
 
 	reply.RunID = runID
@@ -448,6 +475,107 @@ func (s *Server) packagePath(hash string) string {
 	return filepath.Join(s.cfg.PackageDir, hash+".tar")
 }
 
+// RunLostDetection periodically marks machines whose heartbeat has exceeded
+// heartbeatTimeout as lost, marks their tasks Lost, and attempts to reschedule
+// those tasks on healthy machines. It runs until the process exits.
+func (s *Server) RunLostDetection(checkInterval, heartbeatTimeout time.Duration) {
+	for {
+		time.Sleep(checkInterval)
+		s.mu.Lock()
+		now := time.Now()
+		for id, m := range s.machines {
+			if now.Sub(m.LastHeartbeat) > heartbeatTimeout {
+				s.handleLostMachine(id)
+			}
+		}
+		s.rescheduleLostTasks()
+		s.mu.Unlock()
+	}
+}
+
+// handleLostMachine removes the machine and marks its active tasks as Lost.
+// Must be called with s.mu held.
+func (s *Server) handleLostMachine(machineID string) {
+	delete(s.machines, machineID)
+	delete(s.machineQueues, machineID)
+	for _, run := range s.runs {
+		changed := false
+		for _, task := range run.Tasks {
+			if task.MachineID != machineID {
+				continue
+			}
+			switch task.Status {
+			case api.TaskPending, api.TaskFetching, api.TaskRunning:
+				task.Status = api.TaskLost
+				changed = true
+			}
+		}
+		if changed {
+			run.Status = computeRunStatus(run.Tasks)
+		}
+	}
+}
+
+// rescheduleLostTasks tries to assign any Lost tasks to a healthy machine.
+// Must be called with s.mu held.
+func (s *Server) rescheduleLostTasks() {
+	for _, run := range s.runs {
+		changed := false
+		for _, task := range run.Tasks {
+			if task.Status == api.TaskLost && s.rescheduleTask(task, run) {
+				changed = true
+			}
+		}
+		if changed {
+			run.Status = computeRunStatus(run.Tasks)
+		}
+	}
+}
+
+// rescheduleTask assigns a Lost task to a new eligible machine, returning true
+// on success. Must be called with s.mu held.
+func (s *Server) rescheduleTask(task *taskRecord, run *runRecord) bool {
+	needRAM := uint64(run.Spec.Requirements.RAM)
+	needDisk := uint64(run.Spec.Requirements.Disk)
+	var eligible []string
+	for id, m := range s.machines {
+		if m.Spec.RAM >= needRAM && m.Spec.Disk >= needDisk {
+			eligible = append(eligible, id)
+		}
+	}
+	if len(eligible) == 0 {
+		return false
+	}
+	machineID := eligible[0]
+	newTaskRunID := uuid.New().String()
+
+	delete(s.taskRunIndex, task.TaskRunID)
+	task.MachineID = machineID
+	task.TaskRunID = newTaskRunID
+	task.Status = api.TaskPending
+	s.taskRunIndex[newTaskRunID] = taskRunRef{task: task, runID: run.RunID}
+
+	for _, pkg := range run.Spec.Packages {
+		s.machineQueues[machineID] = append(s.machineQueues[machineID], api.Command{
+			Type: api.CmdFetchPackage,
+			FetchPackage: &api.FetchPackageDetails{
+				PackageName: pkg.Name,
+				PackageHash: run.PackageHashes[pkg.Name],
+			},
+		})
+	}
+	s.machineQueues[machineID] = append(s.machineQueues[machineID], api.Command{
+		Type: api.CmdRunBinary,
+		RunBinary: &api.RunBinaryDetails{
+			RunID:       newTaskRunID,
+			PackageName: run.Spec.Binary.Package,
+			BinaryPath:  run.Spec.Binary.Path,
+			Args:        expandArgs(run.Spec.Args, task.TaskNumber),
+		},
+	})
+	return true
+}
+
 func expandArgs(args []string, taskNumber int) []string {
 	out := make([]string, len(args))
 	for i, a := range args {
@@ -457,26 +585,40 @@ func expandArgs(args []string, taskNumber int) []string {
 }
 
 func computeRunStatus(tasks []*taskRecord) api.RunStatus {
-	anyRunning, anyPending, anyFailed := false, false, false
+	var running, pending, fetching, complete, failed, lost, cancelled int
 	for _, t := range tasks {
 		switch t.Status {
 		case api.TaskRunning:
-			anyRunning = true
+			running++
 		case api.TaskPending:
-			anyPending = true
+			pending++
+		case api.TaskFetching:
+			fetching++
+		case api.TaskComplete:
+			complete++
 		case api.TaskFailed:
-			anyFailed = true
+			failed++
+		case api.TaskLost:
+			lost++
+		case api.TaskCancelled:
+			cancelled++
 		}
 	}
+	total := len(tasks)
 	switch {
-	case anyRunning:
+	case running > 0:
 		return api.RunRunning
-	case anyPending:
+	case pending+fetching+lost > 0:
+		// Lost tasks are awaiting reschedule — the run is still active.
 		return api.RunPending
-	case anyFailed:
-		return api.RunFailed
-	default:
+	case complete == total:
 		return api.RunComplete
+	case cancelled == total:
+		return api.RunCancelled
+	case complete > 0:
+		return api.RunPartialFailure
+	default:
+		return api.RunFailed
 	}
 }
 

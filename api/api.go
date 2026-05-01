@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"time"
 	"vdc/jobspec"
 )
@@ -20,7 +21,8 @@ type MachineInfo struct {
 
 // RegisterRequest is the argument to the RegisterMachine RPC.
 type RegisterRequest struct {
-	Spec MachineSpec
+	Spec          MachineSpec
+	ActiveTaskIDs []string // task run IDs the machine was executing before reconnecting
 }
 
 // RegisterReply is the reply from the RegisterMachine RPC.
@@ -67,26 +69,74 @@ type SubmitJobReply struct {
 }
 
 // TaskStatus is the lifecycle state of a single task replica.
-type TaskStatus string
+type TaskStatus int
 
 const (
-	TaskPending  TaskStatus = "pending"
-	TaskRunning  TaskStatus = "running"
-	TaskComplete TaskStatus = "complete"
-	TaskFailed   TaskStatus = "failed"
+	TaskPending   TaskStatus = iota // assigned to a machine, not yet started
+	TaskFetching                    // machine is downloading the package
+	TaskRunning                     // binary is executing
+	TaskComplete                    // binary exited successfully
+	TaskFailed                      // binary exited with an error
+	TaskLost                        // machine stopped heartbeating; outcome unknown
+	TaskCancelled                   // cancelled before or during execution
 )
 
-// RunStatus is the lifecycle state of an entire job run.
-type RunStatus string
+func (s TaskStatus) String() string {
+	switch s {
+	case TaskPending:
+		return "pending"
+	case TaskFetching:
+		return "fetching"
+	case TaskRunning:
+		return "running"
+	case TaskComplete:
+		return "complete"
+	case TaskFailed:
+		return "failed"
+	case TaskLost:
+		return "lost"
+	case TaskCancelled:
+		return "cancelled"
+	default:
+		return fmt.Sprintf("TaskStatus(%d)", int(s))
+	}
+}
+
+// RunStatus is the aggregate lifecycle state of a job run.
+type RunStatus int
 
 const (
-	RunPending  RunStatus = "pending"
-	RunRunning  RunStatus = "running"
-	RunComplete RunStatus = "complete"
-	RunFailed   RunStatus = "failed"
+	RunScheduling     RunStatus = iota // tasks are being assigned to machines
+	RunPending                         // all tasks assigned; none running yet
+	RunRunning                         // at least one task is executing
+	RunComplete                        // all tasks completed successfully
+	RunPartialFailure                  // some tasks completed, at least one failed or was lost
+	RunFailed                          // all tasks finished; none succeeded
+	RunCancelled                       // all tasks were cancelled
 )
 
-// ReportTaskStatusRequest is sent by a machine to update its task's status.
+func (s RunStatus) String() string {
+	switch s {
+	case RunScheduling:
+		return "scheduling"
+	case RunPending:
+		return "pending"
+	case RunRunning:
+		return "running"
+	case RunComplete:
+		return "complete"
+	case RunPartialFailure:
+		return "partial_failure"
+	case RunFailed:
+		return "failed"
+	case RunCancelled:
+		return "cancelled"
+	default:
+		return fmt.Sprintf("RunStatus(%d)", int(s))
+	}
+}
+
+// ReportTaskStatusRequest is sent by a machine to update its task's lifecycle state.
 type ReportTaskStatusRequest struct {
 	TaskRunID string
 	Status    TaskStatus
@@ -112,6 +162,7 @@ const (
 	CmdFetchPackage CommandType = "FetchPackage"
 	CmdRunBinary    CommandType = "RunBinary"
 	CmdSendFile     CommandType = "SendFile"
+	CmdCancelTask   CommandType = "CancelTask"
 )
 
 // FetchPackageDetails carries the parameters for a FetchPackage command.
@@ -122,18 +173,23 @@ type FetchPackageDetails struct {
 
 // RunBinaryDetails carries the parameters for a RunBinary command.
 type RunBinaryDetails struct {
-	RunID       string   // unique ID for this task execution; used as the run directory name
-	PackageName string   // package containing the binary
-	BinaryPath  string   // path to the binary within the package
-	Args        []string // commandline arguments
+	RunID       string   // unique ID for this task execution
+	PackageName string
+	BinaryPath  string
+	Args        []string
 }
 
 // SendFileDetails carries the parameters for a SendFile command.
 type SendFileDetails struct {
-	RequestID  string // pull request to satisfy
-	TaskRunID  string // run directory on this machine
+	RequestID  string
+	TaskRunID  string
 	TaskNumber int
 	Filename   string
+}
+
+// CancelTaskDetails carries the parameters for a CancelTask command.
+type CancelTaskDetails struct {
+	RunID string // task run ID to kill
 }
 
 // Command is a unit of work dispatched to a machine.
@@ -142,6 +198,7 @@ type Command struct {
 	FetchPackage *FetchPackageDetails // non-nil when Type == CmdFetchPackage
 	RunBinary    *RunBinaryDetails    // non-nil when Type == CmdRunBinary
 	SendFile     *SendFileDetails     // non-nil when Type == CmdSendFile
+	CancelTask   *CancelTaskDetails   // non-nil when Type == CmdCancelTask
 }
 
 // GetCommandRequest is the argument to the GetCommand RPC.
@@ -174,7 +231,7 @@ type PullFilesRequest struct {
 // PullFilesReply is the reply from the PullFiles RPC.
 type PullFilesReply struct {
 	RequestID string
-	Total     int // number of files to expect
+	Total     int
 }
 
 // UploadFileRequest is sent by a machine to deliver a requested file to the server.
@@ -208,4 +265,3 @@ type GetPullResultReply struct {
 	TarData  []byte          // tar of <taskNumber>.<filename> entries; populated when Done
 	Errors   []PullFileError // per-task errors, if any
 }
-

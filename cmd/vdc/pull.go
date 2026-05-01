@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"vdc/api"
 	"vdc/client"
 )
 
@@ -39,7 +40,7 @@ func cmdPull(args []string) {
 		fmt.Fprintf(os.Stderr, "get run status: %v\n", err)
 		os.Exit(1)
 	}
-	if status == "pending" || status == "running" {
+	if status == api.RunPending || status == api.RunRunning {
 		if !confirm(fmt.Sprintf("Run is still %s. Pull anyway?", status)) {
 			fmt.Println("Aborted.")
 			return

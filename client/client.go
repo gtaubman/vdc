@@ -22,8 +22,10 @@ func Dial(host string, port int) (*Client, error) {
 }
 
 // RegisterMachine registers this machine with the leader.
-func (c *Client) RegisterMachine(spec api.MachineSpec) (string, error) {
-	args := &api.RegisterRequest{Spec: spec}
+// activeTaskIDs should list any task run IDs the machine was executing before
+// a disconnect; pass nil on first join.
+func (c *Client) RegisterMachine(spec api.MachineSpec, activeTaskIDs []string) (string, error) {
+	args := &api.RegisterRequest{Spec: spec, ActiveTaskIDs: activeTaskIDs}
 	reply := &api.RegisterReply{}
 	if err := c.rpc.Call("Server.RegisterMachine", args, reply); err != nil {
 		return "", err
@@ -131,7 +133,7 @@ func (c *Client) GetRunStatus(runID string) (api.RunStatus, error) {
 	args := &api.GetRunStatusRequest{RunID: runID}
 	reply := &api.GetRunStatusReply{}
 	if err := c.rpc.Call("Server.GetRunStatus", args, reply); err != nil {
-		return "", err
+		return 0, err
 	}
 	return reply.Status, nil
 }
