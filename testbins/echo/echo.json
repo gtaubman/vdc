@@ -1,0 +1,19 @@
+{
+  "name": "echo",
+  "packages": [
+    {
+      "name": "echo",
+      "files": ["testbins/build/echo"]
+    }
+  ],
+  "binary": {
+    "package": "echo",
+    "path": "echo"
+  },
+  "requirements": {
+    "ram": "64M",
+    "disk": "64M"
+  },
+  "replicas": 2,
+  "args": ["hello", "world"]
+}
