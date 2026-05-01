@@ -19,7 +19,15 @@ type Machine struct {
 	ID      string
 	BaseDir string
 	Spec    api.MachineSpec
-	client  *client.Client
+
+	host string
+	port int
+
+	mu          sync.Mutex // protects client, ID, connEpoch
+	client      *client.Client
+	connEpoch   int
+
+	reconnectMu sync.Mutex // serializes reconnect attempts
 
 	fetchMu sync.Mutex
 	// fetchDone is keyed by package hash. A closed channel means the fetch
@@ -27,18 +35,10 @@ type Machine struct {
 	fetchDone map[string]chan struct{}
 }
 
-// Join connects to the leader, registers this machine, and creates a basedir for job execution.
+// Join connects to the leader, registers this machine, and creates a basedir
+// for job execution. It retries every second until the server is reachable.
 func Join(host string, port int, spec api.MachineSpec) (*Machine, error) {
-	c, err := client.Dial(host, port)
-	if err != nil {
-		return nil, fmt.Errorf("dial: %w", err)
-	}
-
-	id, err := c.RegisterMachine(spec)
-	if err != nil {
-		c.Close()
-		return nil, fmt.Errorf("register: %w", err)
-	}
+	c, id := dialAndRegister(host, port, spec)
 
 	baseDir, err := os.MkdirTemp("", "vdc-machine-*")
 	if err != nil {
@@ -47,12 +47,66 @@ func Join(host string, port int, spec api.MachineSpec) (*Machine, error) {
 	}
 
 	return &Machine{
-		ID:              id,
-		BaseDir:         baseDir,
-		Spec:            spec,
-		client:          c,
+		ID:        id,
+		BaseDir:   baseDir,
+		Spec:      spec,
+		host:      host,
+		port:      port,
+		client:    c,
 		fetchDone: make(map[string]chan struct{}),
 	}, nil
+}
+
+// dialAndRegister retries dial+register every second until both succeed.
+func dialAndRegister(host string, port int, spec api.MachineSpec) (*client.Client, string) {
+	for {
+		c, err := client.Dial(host, port)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "vdc: dial %s:%d: %v\n", host, port, err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		id, err := c.RegisterMachine(spec)
+		if err != nil {
+			c.Close()
+			fmt.Fprintf(os.Stderr, "vdc: register: %v\n", err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		return c, id
+	}
+}
+
+// conn returns the current client, machine ID, and connection epoch atomically.
+func (m *Machine) conn() (*client.Client, string, int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.client, m.ID, m.connEpoch
+}
+
+// maybeReconnect re-dials the leader and re-registers if the connection has
+// not already been restored by another goroutine (detected via epoch). It
+// blocks until the reconnect succeeds, retrying every second.
+func (m *Machine) maybeReconnect(epoch int) {
+	m.reconnectMu.Lock()
+	defer m.reconnectMu.Unlock()
+
+	m.mu.Lock()
+	alreadyFixed := m.connEpoch != epoch
+	m.mu.Unlock()
+	if alreadyFixed {
+		return
+	}
+
+	c, id := dialAndRegister(m.host, m.port, m.Spec)
+
+	m.mu.Lock()
+	old := m.client
+	m.client = c
+	m.ID = id
+	m.connEpoch++
+	m.mu.Unlock()
+	old.Close()
 }
 
 // RunHeartbeats sends heartbeats to the leader on the given interval.
@@ -60,8 +114,10 @@ func Join(host string, port int, spec api.MachineSpec) (*Machine, error) {
 func (m *Machine) RunHeartbeats(interval time.Duration, errFn func(error)) {
 	for {
 		time.Sleep(interval)
-		if err := m.client.Heartbeat(m.ID); err != nil {
+		c, id, epoch := m.conn()
+		if err := c.Heartbeat(id); err != nil {
 			errFn(err)
+			m.maybeReconnect(epoch)
 		}
 	}
 }
@@ -72,9 +128,11 @@ func (m *Machine) RunHeartbeats(interval time.Duration, errFn func(error)) {
 func (m *Machine) RunCommandLoop(errFn func(error)) {
 	for {
 		time.Sleep(1 * time.Second)
-		cmds, err := m.client.GetCommand(m.ID)
+		c, id, epoch := m.conn()
+		cmds, err := c.GetCommand(id)
 		if err != nil {
 			errFn(err)
+			m.maybeReconnect(epoch)
 			continue
 		}
 		for _, cmd := range cmds {
@@ -119,7 +177,10 @@ func (m *Machine) fetchPackage(details *api.FetchPackageDetails) error {
 
 	defer close(done)
 
-	data, err := m.client.FetchPackage(details.PackageHash)
+	m.mu.Lock()
+	c := m.client
+	m.mu.Unlock()
+	data, err := c.FetchPackage(details.PackageHash)
 	if err != nil {
 		return fmt.Errorf("fetch package %q: %w", details.PackageName, err)
 	}
@@ -134,7 +195,11 @@ func (m *Machine) fetchPackage(details *api.FetchPackageDetails) error {
 }
 
 func (m *Machine) runBinary(details *api.RunBinaryDetails) error {
-	if err := m.client.ReportTaskStatus(details.RunID, api.TaskRunning); err != nil {
+	m.mu.Lock()
+	c := m.client
+	m.mu.Unlock()
+
+	if err := c.ReportTaskStatus(details.RunID, api.TaskRunning); err != nil {
 		return fmt.Errorf("report task running: %w", err)
 	}
 
@@ -165,19 +230,23 @@ func (m *Machine) runBinary(details *api.RunBinaryDetails) error {
 	if runErr != nil {
 		status = api.TaskFailed
 	}
-	if err := m.client.ReportTaskStatus(details.RunID, status); err != nil {
+	if err := c.ReportTaskStatus(details.RunID, status); err != nil {
 		return fmt.Errorf("report task complete: %w", err)
 	}
 	return runErr
 }
 
 func (m *Machine) sendFile(details *api.SendFileDetails) error {
+	m.mu.Lock()
+	c := m.client
+	m.mu.Unlock()
+
 	path := filepath.Join(m.BaseDir, "runs", details.TaskRunID, details.Filename)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return m.client.UploadFile(details.RequestID, details.TaskNumber, details.Filename, nil, err.Error())
+		return c.UploadFile(details.RequestID, details.TaskNumber, details.Filename, nil, err.Error())
 	}
-	return m.client.UploadFile(details.RequestID, details.TaskNumber, details.Filename, data, "")
+	return c.UploadFile(details.RequestID, details.TaskNumber, details.Filename, data, "")
 }
 
 func extractTar(data []byte, destDir string) error {
@@ -207,5 +276,8 @@ func extractTar(data []byte, destDir string) error {
 // Close cleans up the machine's basedir and closes the leader connection.
 func (m *Machine) Close() error {
 	os.RemoveAll(m.BaseDir)
-	return m.client.Close()
+	m.mu.Lock()
+	c := m.client
+	m.mu.Unlock()
+	return c.Close()
 }

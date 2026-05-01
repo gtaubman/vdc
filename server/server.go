@@ -51,11 +51,17 @@ type RunSummary struct {
 	Replicas int
 }
 
+// PackageInfo pairs a package name with its content hash.
+type PackageInfo struct {
+	Name string
+	Hash string
+}
+
 // StatusSnapshot is a point-in-time view of the datacenter for the leader display.
 type StatusSnapshot struct {
 	Machines         []api.MachineInfo
 	MachineJobCounts map[string]int // machine ID -> number of currently running tasks
-	PackageHashes    []string
+	Packages         []PackageInfo
 	Runs             []RunSummary
 }
 
@@ -76,11 +82,12 @@ type pullState struct {
 
 // Server is the VDC leader server.
 type Server struct {
-	cfg           Config
-	mu            sync.Mutex
-	machines      map[string]*api.MachineInfo
-	runs          map[string]*runRecord
-	taskRunIndex  map[string]taskRunRef // task run ID -> (task pointer, run ID)
+	cfg          Config
+	mu           sync.Mutex
+	machines     map[string]*api.MachineInfo
+	packageNames map[string]string // content hash -> package name
+	runs         map[string]*runRecord
+	taskRunIndex map[string]taskRunRef // task run ID -> (task pointer, run ID)
 	machineQueues map[string][]api.Command
 	pullRequests  map[string]*pullState
 }
@@ -97,6 +104,7 @@ func New(cfg Config) (*Server, error) {
 	return &Server{
 		cfg:           cfg,
 		machines:      make(map[string]*api.MachineInfo),
+		packageNames:  make(map[string]string),
 		runs:          make(map[string]*runRecord),
 		taskRunIndex:  make(map[string]taskRunRef),
 		machineQueues: make(map[string][]api.Command),
@@ -217,6 +225,10 @@ func (s *Server) SubmitJob(args *api.SubmitJobRequest, reply *api.SubmitJobReply
 				Args:        expandArgs(spec.Args, i),
 			},
 		})
+	}
+
+	for name, hash := range args.PackageHashes {
+		s.packageNames[hash] = name
 	}
 
 	s.runs[runID] = &runRecord{
@@ -393,10 +405,11 @@ func (s *Server) Status() StatusSnapshot {
 	}
 
 	entries, _ := os.ReadDir(s.cfg.PackageDir)
-	var hashes []string
+	var packages []PackageInfo
 	for _, e := range entries {
 		if strings.HasSuffix(e.Name(), ".tar") {
-			hashes = append(hashes, strings.TrimSuffix(e.Name(), ".tar"))
+			hash := strings.TrimSuffix(e.Name(), ".tar")
+			packages = append(packages, PackageInfo{Name: s.packageNames[hash], Hash: hash})
 		}
 	}
 
@@ -413,7 +426,7 @@ func (s *Server) Status() StatusSnapshot {
 	return StatusSnapshot{
 		Machines:         machines,
 		MachineJobCounts: jobCounts,
-		PackageHashes:    hashes,
+		Packages:         packages,
 		Runs:             runs,
 	}
 }

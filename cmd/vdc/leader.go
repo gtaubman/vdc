@@ -55,11 +55,11 @@ func printStatus(srv *server.Server) {
 		}
 
 		// Packages
-		fmt.Printf("\nPACKAGES (%d)\n", len(snap.PackageHashes))
-		for _, h := range snap.PackageHashes {
-			fmt.Printf("  %s\n", h)
+		fmt.Printf("\nPACKAGES (%d)\n", len(snap.Packages))
+		for _, p := range snap.Packages {
+			fmt.Printf("  %-20s  %s\n", p.Name, p.Hash)
 		}
-		if len(snap.PackageHashes) == 0 {
+		if len(snap.Packages) == 0 {
 			fmt.Println("  (none)")
 		}
 
