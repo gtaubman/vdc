@@ -71,18 +71,22 @@ func printStatus(srv *server.Server) {
 
 		// Runs
 		fmt.Printf("\nRUNS (%d)\n", len(snap.Runs))
-		fmt.Printf("  %-8s  %-20s  %-8s  %s\n", "RUN ID", "JOB", "STATUS", "REPLICAS")
-		fmt.Println("  " + repeat("-", 52))
+		if len(snap.Runs) == 0 {
+			fmt.Println("  (none)")
+		}
 		for _, r := range snap.Runs {
-			fmt.Printf("  %-8s  %-20s  %-8s  %d\n",
+			fmt.Printf("  %s  %-20s  %s\n",
 				shortID(r.RunID),
 				truncate(r.JobName, 20),
 				r.Status,
-				r.Replicas,
 			)
-		}
-		if len(snap.Runs) == 0 {
-			fmt.Println("  (none)")
+			for _, t := range r.Tasks {
+				machine := shortID(t.MachineID)
+				if t.MachineID == "" {
+					machine = "(unassigned)"
+				}
+				fmt.Printf("    task %-4d  %-12s  %s\n", t.TaskNumber, t.Status, machine)
+			}
 		}
 
 		time.Sleep(2 * time.Second)

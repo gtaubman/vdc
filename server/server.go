@@ -73,12 +73,20 @@ type Config struct {
 	LogPath    string // log file path; "" logs to stderr
 }
 
+// TaskSummary is a brief description of one task for the status display.
+type TaskSummary struct {
+	TaskNumber int
+	MachineID  string
+	Status     api.TaskStatus
+}
+
 // RunSummary is a brief description of a run for the status display.
 type RunSummary struct {
 	RunID    string
 	JobName  string
 	Status   api.RunStatus
 	Replicas int
+	Tasks    []TaskSummary
 }
 
 // PackageInfo pairs a package name with its content hash.
@@ -626,11 +634,10 @@ func (s *Server) Status() StatusSnapshot {
 	}
 
 	var runs []RunSummary
-	rows, err := s.db.Query(`
+	if rows, err := s.db.Query(`
 		SELECT r.run_id, r.job_name, r.status, COUNT(t.task_run_id)
 		FROM runs r LEFT JOIN tasks t ON r.run_id = t.run_id
-		GROUP BY r.run_id`)
-	if err == nil {
+		GROUP BY r.run_id`); err == nil {
 		for rows.Next() {
 			var r RunSummary
 			var status int
@@ -639,6 +646,23 @@ func (s *Server) Status() StatusSnapshot {
 			runs = append(runs, r)
 		}
 		rows.Close()
+	}
+
+	// Populate per-task details for each run.
+	for i := range runs {
+		if rows, err := s.db.Query(`
+			SELECT task_number, COALESCE(machine_id, ''), status
+			FROM tasks WHERE run_id = ? ORDER BY task_number`,
+			runs[i].RunID); err == nil {
+			for rows.Next() {
+				var ts TaskSummary
+				var status int
+				rows.Scan(&ts.TaskNumber, &ts.MachineID, &status)
+				ts.Status = api.TaskStatus(status)
+				runs[i].Tasks = append(runs[i].Tasks, ts)
+			}
+			rows.Close()
+		}
 	}
 
 	return StatusSnapshot{
