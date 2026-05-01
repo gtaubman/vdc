@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,8 +21,9 @@ type Machine struct {
 	BaseDir string
 	Spec    api.MachineSpec
 
-	host string
-	port int
+	host   string
+	port   int
+	logger *log.Logger
 
 	mu          sync.Mutex // protects client, ID, connEpoch
 	client      *client.Client
@@ -38,9 +40,19 @@ type Machine struct {
 	fetchDone map[string]chan struct{}
 }
 
+func shortID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
+}
+
 // Join connects to the leader, registers this machine, and creates a basedir
 // for job execution. It retries every second until the server is reachable.
 func Join(host string, port int, spec api.MachineSpec) (*Machine, error) {
+	logger := log.New(os.Stderr, "", log.LstdFlags)
+	logger.Printf("connecting to leader at %s:%d...", host, port)
+
 	c, id := dialAndRegister(host, port, "", spec, nil)
 
 	baseDir, err := os.MkdirTemp("", "vdc-machine-*")
@@ -49,12 +61,15 @@ func Join(host string, port int, spec api.MachineSpec) (*Machine, error) {
 		return nil, fmt.Errorf("create basedir: %w", err)
 	}
 
+	logger.Printf("joined as %s  basedir: %s", shortID(id), baseDir)
+
 	return &Machine{
 		ID:         id,
 		BaseDir:    baseDir,
 		Spec:       spec,
 		host:       host,
 		port:       port,
+		logger:     logger,
 		client:     c,
 		activeRuns: make(map[string]*exec.Cmd),
 		fetchDone:  make(map[string]chan struct{}),
@@ -115,7 +130,9 @@ func (m *Machine) maybeReconnect(epoch int) {
 		return
 	}
 
+	m.logger.Printf("lost connection to leader; reconnecting...")
 	c, id := dialAndRegister(m.host, m.port, m.ID, m.Spec, m.activeTaskIDs())
+	m.logger.Printf("reconnected as %s", shortID(id))
 
 	m.mu.Lock()
 	old := m.client
@@ -184,6 +201,7 @@ func (m *Machine) execute(cmd api.Command) error {
 }
 
 func (m *Machine) cancelTask(details *api.CancelTaskDetails) error {
+	m.logger.Printf("task %s: cancelling", shortID(details.RunID))
 	m.activeMu.Lock()
 	cmd := m.activeRuns[details.RunID]
 	m.activeMu.Unlock()
@@ -204,6 +222,7 @@ func (m *Machine) fetchPackage(details *api.FetchPackageDetails) error {
 	m.fetchDone[details.PackageHash] = done
 	m.fetchMu.Unlock()
 
+	m.logger.Printf("fetching package %s", details.PackageName)
 	defer close(done)
 
 	m.mu.Lock()
@@ -227,6 +246,8 @@ func (m *Machine) runBinary(details *api.RunBinaryDetails) error {
 	m.mu.Lock()
 	c := m.client
 	m.mu.Unlock()
+
+	m.logger.Printf("task %s: starting %s %v", shortID(details.RunID), details.BinaryPath, details.Args)
 
 	if err := c.ReportTaskStatus(details.RunID, api.TaskRunning); err != nil {
 		return fmt.Errorf("report task running: %w", err)
@@ -273,6 +294,9 @@ func (m *Machine) runBinary(details *api.RunBinaryDetails) error {
 	status := api.TaskComplete
 	if runErr != nil {
 		status = api.TaskFailed
+		m.logger.Printf("task %s: failed: %v", shortID(details.RunID), runErr)
+	} else {
+		m.logger.Printf("task %s: complete", shortID(details.RunID))
 	}
 	if err := c.ReportTaskStatus(details.RunID, status); err != nil {
 		return fmt.Errorf("report task complete: %w", err)
@@ -285,6 +309,7 @@ func (m *Machine) sendFile(details *api.SendFileDetails) error {
 	c := m.client
 	m.mu.Unlock()
 
+	m.logger.Printf("task %s: uploading %s", shortID(details.TaskRunID), details.Filename)
 	path := filepath.Join(m.BaseDir, "runs", details.TaskRunID, details.Filename)
 	data, err := os.ReadFile(path)
 	if err != nil {

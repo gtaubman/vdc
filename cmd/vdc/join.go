@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"time"
 	"vdc/api"
@@ -29,11 +30,8 @@ func cmdJoin(args []string) {
 	}
 	defer m.Close()
 
-	fmt.Printf("Joined datacenter as machine %s\n", m.ID)
-	fmt.Printf("Basedir: %s\n", m.BaseDir)
-
 	errFn := func(err error) {
-		fmt.Fprintln(os.Stderr, err)
+		log.Printf("error: %v", err)
 	}
 
 	go m.RunHeartbeats(*heartbeat, errFn)
