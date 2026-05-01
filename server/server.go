@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/rpc"
 	"os"
@@ -69,6 +70,7 @@ CREATE TABLE IF NOT EXISTS pull_results (
 type Config struct {
 	PackageDir string
 	DBPath     string // SQLite path; "" uses ":memory:"
+	LogPath    string // log file path; "" logs to stderr
 }
 
 // RunSummary is a brief description of a run for the status display.
@@ -101,8 +103,9 @@ type pullFileResult struct {
 
 // Server is the VDC leader server.
 type Server struct {
-	cfg Config
-	db  *sql.DB
+	cfg    Config
+	db     *sql.DB
+	logger *log.Logger
 }
 
 // New creates a new Server. If cfg.PackageDir is empty, a temp dir is created.
@@ -136,11 +139,26 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
 
-	return &Server{cfg: cfg, db: db}, nil
+	var logger *log.Logger
+	if cfg.LogPath != "" {
+		lf, err := os.OpenFile(cfg.LogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("open log file: %w", err)
+		}
+		logger = log.New(lf, "", log.LstdFlags)
+	} else {
+		logger = log.New(os.Stderr, "", log.LstdFlags)
+	}
+
+	return &Server{cfg: cfg, db: db, logger: logger}, nil
 }
 
 // PackageDir returns the directory used to store packages.
 func (s *Server) PackageDir() string { return s.cfg.PackageDir }
+
+// LogPath returns the path of the log file, or "" if logging to stderr.
+func (s *Server) LogPath() string { return s.cfg.LogPath }
 
 // RegisterMachine registers a new machine with the datacenter.
 // If the machine reports ActiveTaskIDs from a previous connection, tasks that
@@ -196,6 +214,8 @@ func (s *Server) RegisterMachine(args *api.RegisterRequest, reply *api.RegisterR
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	s.logger.Printf("RegisterMachine %s  ram=%d disk=%d  active=%d",
+		id, args.Spec.RAM, args.Spec.Disk, len(args.ActiveTaskIDs))
 	reply.MachineID = id
 	return nil
 }
@@ -309,7 +329,11 @@ func (s *Server) ReportTaskStatus(args *api.ReportTaskStatusRequest, reply *api.
 	if err := updateRunStatus(tx, runID); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.logger.Printf("ReportTaskStatus task=%s status=%s", args.TaskRunID, args.Status)
+	return nil
 }
 
 // GetRunStatus returns the current lifecycle state of a run.
@@ -385,6 +409,9 @@ func (s *Server) GetCommand(args *api.GetCommandRequest, reply *api.GetCommandRe
 
 	if err := tx.Commit(); err != nil {
 		return err
+	}
+	if len(cmds) > 0 {
+		s.logger.Printf("GetCommand machine=%s returning %d commands", args.MachineID, len(cmds))
 	}
 	reply.Commands = cmds
 	return nil

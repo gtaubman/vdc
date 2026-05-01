@@ -3,7 +3,6 @@ package server
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"time"
 	"vdc/api"
 	"vdc/jobspec"
@@ -35,7 +34,7 @@ func (s *Server) RunLoop(heartbeatTimeout, startupGrace time.Duration) {
 func (s *Server) scheduleNewRuns() {
 	rows, err := s.db.Query(`SELECT run_id FROM runs WHERE status = ?`, int(api.RunScheduling))
 	if err != nil {
-		log.Printf("scheduleNewRuns: %v", err)
+		s.logger.Printf("scheduleNewRuns: %v", err)
 		return
 	}
 	var runIDs []string
@@ -48,7 +47,7 @@ func (s *Server) scheduleNewRuns() {
 
 	for _, runID := range runIDs {
 		if err := s.tryScheduleRun(runID); err != nil {
-			log.Printf("tryScheduleRun %s: %v", runID, err)
+			s.logger.Printf("tryScheduleRun %s: %v", runID, err)
 		}
 	}
 }
@@ -72,22 +71,19 @@ func (s *Server) tryScheduleRun(runID string) error {
 	needRAM := uint64(spec.Requirements.RAM)
 	needDisk := uint64(spec.Requirements.Disk)
 
-	rows, err := s.db.Query(`SELECT id FROM machines WHERE ram >= ? AND disk >= ?`, needRAM, needDisk)
+	// Build free-capacity map; each assignment this tick is reflected immediately
+	// so we don't over-commit a machine within the same scheduling pass.
+	free, err := s.freeCapacities()
 	if err != nil {
-		return fmt.Errorf("query machines: %w", err)
-	}
-	var eligible []string
-	for rows.Next() {
-		var id string
-		rows.Scan(&id)
-		eligible = append(eligible, id)
-	}
-	rows.Close()
-	if len(eligible) == 0 {
-		return nil // no machines yet; retry next tick
+		return fmt.Errorf("compute capacities: %w", err)
 	}
 
-	rows, err = s.db.Query(`SELECT task_run_id, task_number FROM tasks WHERE run_id = ? AND machine_id IS NULL ORDER BY task_number`, runID)
+	s.logger.Printf("schedule run=%s  need ram=%d disk=%d  machines=%d", runID, needRAM, needDisk, len(free))
+	for machID, c := range free {
+		s.logger.Printf("  machine %s  free ram=%d disk=%d", machID, c.ram, c.disk)
+	}
+
+	rows, err := s.db.Query(`SELECT task_run_id, task_number FROM tasks WHERE run_id = ? AND machine_id IS NULL ORDER BY task_number`, runID)
 	if err != nil {
 		return fmt.Errorf("query unassigned tasks: %w", err)
 	}
@@ -103,10 +99,37 @@ func (s *Server) tryScheduleRun(runID string) error {
 	}
 	rows.Close()
 
+	s.logger.Printf("  unassigned tasks: %d", len(tasks))
+
 	if len(tasks) == 0 {
-		// All tasks already assigned; promote run to Pending.
+		// All tasks already have machines; promote run to Pending.
 		_, err = s.db.Exec(`UPDATE runs SET status = ? WHERE run_id = ?`, int(api.RunPending), runID)
 		return err
+	}
+
+	// Greedily assign tasks to machines that have enough free capacity.
+	// Tasks that don't fit stay unassigned and are retried on the next tick.
+	type assignment struct {
+		taskRunID  string
+		taskNumber int
+		machineID  string
+	}
+	var assignments []assignment
+	for _, task := range tasks {
+		machineID := pickMachine(free, needRAM, needDisk)
+		if machineID == "" {
+			s.logger.Printf("  task %d: no machine has ram=%d disk=%d free", task.taskNumber, needRAM, needDisk)
+			break // if one task can't fit, none will (same requirements)
+		}
+		free[machineID].ram -= needRAM
+		free[machineID].disk -= needDisk
+		assignments = append(assignments, assignment{task.taskRunID, task.taskNumber, machineID})
+	}
+
+	s.logger.Printf("  assigned %d/%d tasks this tick", len(assignments), len(tasks))
+
+	if len(assignments) == 0 {
+		return nil // nothing fits this tick; retry later
 	}
 
 	tx, err := s.db.Begin()
@@ -115,31 +138,33 @@ func (s *Server) tryScheduleRun(runID string) error {
 	}
 	defer tx.Rollback()
 
-	for i, task := range tasks {
-		machineID := eligible[i%len(eligible)]
-		if _, err := tx.Exec(`UPDATE tasks SET machine_id = ? WHERE task_run_id = ?`, machineID, task.taskRunID); err != nil {
+	for _, a := range assignments {
+		if _, err := tx.Exec(`UPDATE tasks SET machine_id = ? WHERE task_run_id = ?`, a.machineID, a.taskRunID); err != nil {
 			return err
 		}
 		for _, pkg := range spec.Packages {
-			if err := insertCommand(tx, machineID, api.CmdFetchPackage, &api.FetchPackageDetails{
+			if err := insertCommand(tx, a.machineID, api.CmdFetchPackage, &api.FetchPackageDetails{
 				PackageName: pkg.Name,
 				PackageHash: hashes[pkg.Name],
 			}); err != nil {
 				return err
 			}
 		}
-		if err := insertCommand(tx, machineID, api.CmdRunBinary, &api.RunBinaryDetails{
-			RunID:       task.taskRunID,
+		if err := insertCommand(tx, a.machineID, api.CmdRunBinary, &api.RunBinaryDetails{
+			RunID:       a.taskRunID,
 			PackageName: spec.Binary.Package,
 			BinaryPath:  spec.Binary.Path,
-			Args:        expandArgs(spec.Args, task.taskNumber),
+			Args:        expandArgs(spec.Args, a.taskNumber),
 		}); err != nil {
 			return err
 		}
 	}
 
-	if _, err := tx.Exec(`UPDATE runs SET status = ? WHERE run_id = ?`, int(api.RunPending), runID); err != nil {
-		return err
+	// Only promote to RunPending once every task has a machine.
+	if len(assignments) == len(tasks) {
+		if _, err := tx.Exec(`UPDATE runs SET status = ? WHERE run_id = ?`, int(api.RunPending), runID); err != nil {
+			return err
+		}
 	}
 
 	return tx.Commit()
@@ -150,7 +175,7 @@ func (s *Server) detectAndRescheduleLost(heartbeatTimeout time.Duration) {
 
 	rows, err := s.db.Query(`SELECT id FROM machines WHERE last_heartbeat < ?`, cutoff)
 	if err != nil {
-		log.Printf("detectAndRescheduleLost: %v", err)
+		s.logger.Printf("detectAndRescheduleLost: %v", err)
 		return
 	}
 	var lostMachines []string
@@ -163,11 +188,11 @@ func (s *Server) detectAndRescheduleLost(heartbeatTimeout time.Duration) {
 
 	for _, machineID := range lostMachines {
 		if err := s.handleLostMachine(machineID); err != nil {
-			log.Printf("handleLostMachine %s: %v", machineID, err)
+			s.logger.Printf("handleLostMachine %s: %v", machineID, err)
 		}
 	}
 	if err := s.rescheduleLostTasks(); err != nil {
-		log.Printf("rescheduleLostTasks: %v", err)
+		s.logger.Printf("rescheduleLostTasks: %v", err)
 	}
 }
 
@@ -235,7 +260,7 @@ func (s *Server) rescheduleLostTasks() error {
 
 	for _, t := range lost {
 		if err := s.rescheduleTask(t.taskRunID, t.runID, t.taskNumber, t.specJSON, t.hashesJSON); err != nil {
-			log.Printf("rescheduleTask %s: %v", t.taskRunID, err)
+			s.logger.Printf("rescheduleTask %s: %v", t.taskRunID, err)
 		}
 	}
 	return nil
@@ -251,25 +276,18 @@ func (s *Server) rescheduleTask(taskRunID, runID string, taskNumber int, specJSO
 		return err
 	}
 
+	free, err := s.freeCapacities()
+	if err != nil {
+		return fmt.Errorf("compute capacities: %w", err)
+	}
 	needRAM := uint64(spec.Requirements.RAM)
 	needDisk := uint64(spec.Requirements.Disk)
 
-	rows, err := s.db.Query(`SELECT id FROM machines WHERE ram >= ? AND disk >= ?`, needRAM, needDisk)
-	if err != nil {
-		return err
-	}
-	var eligible []string
-	for rows.Next() {
-		var id string
-		rows.Scan(&id)
-		eligible = append(eligible, id)
-	}
-	rows.Close()
-	if len(eligible) == 0 {
-		return nil // no machines available; try again next tick
+	machineID := pickMachine(free, needRAM, needDisk)
+	if machineID == "" {
+		return nil // no capacity yet; retry next tick
 	}
 
-	machineID := eligible[0]
 	newTaskRunID := uuid.New().String()
 
 	tx, err := s.db.Begin()
@@ -308,4 +326,76 @@ func (s *Server) rescheduleTask(taskRunID, runID string, taskNumber int, specJSO
 	}
 
 	return tx.Commit()
+}
+
+// capacity tracks the free RAM and disk on a machine.
+type capacity struct{ ram, disk uint64 }
+
+// freeCapacities returns the available RAM and disk for every registered
+// machine, after subtracting resources consumed by tasks that are currently
+// pending, fetching, or running.
+func (s *Server) freeCapacities() (map[string]*capacity, error) {
+	free := make(map[string]*capacity)
+
+	rows, err := s.db.Query(`SELECT id, ram, disk FROM machines`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id string
+		var ram, disk uint64
+		rows.Scan(&id, &ram, &disk)
+		free[id] = &capacity{ram, disk}
+	}
+	rows.Close()
+
+	// Subtract resources held by active tasks.
+	rows, err = s.db.Query(`
+		SELECT t.machine_id, r.spec_json
+		FROM tasks t JOIN runs r ON t.run_id = r.run_id
+		WHERE t.machine_id IS NOT NULL AND t.status IN (?, ?, ?)`,
+		int(api.TaskPending), int(api.TaskFetching), int(api.TaskRunning))
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var machineID, specJSON string
+		rows.Scan(&machineID, &specJSON)
+		var spec jobspec.JobSpec
+		if err := json.Unmarshal([]byte(specJSON), &spec); err != nil {
+			continue
+		}
+		if c, ok := free[machineID]; ok {
+			needRAM := uint64(spec.Requirements.RAM)
+			needDisk := uint64(spec.Requirements.Disk)
+			if c.ram >= needRAM {
+				c.ram -= needRAM
+			} else {
+				c.ram = 0
+			}
+			if c.disk >= needDisk {
+				c.disk -= needDisk
+			} else {
+				c.disk = 0
+			}
+		}
+	}
+	rows.Close()
+
+	return free, nil
+}
+
+// pickMachine returns the ID of the machine with the most free RAM that still
+// satisfies the requirements, or "" if none qualifies. Preferring the most
+// free machine spreads load rather than packing tasks onto a single box.
+func pickMachine(free map[string]*capacity, needRAM, needDisk uint64) string {
+	var best string
+	var bestRAM uint64
+	for id, c := range free {
+		if c.ram >= needRAM && c.disk >= needDisk && c.ram > bestRAM {
+			best = id
+			bestRAM = c.ram
+		}
+	}
+	return best
 }

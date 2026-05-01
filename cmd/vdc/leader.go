@@ -13,10 +13,11 @@ func cmdLeader(args []string) {
 	port := fs.Int("port", 8080, "port to listen on")
 	packageDir := fs.String("package_dir", "vdc-packages", "directory to store packages")
 	dbPath := fs.String("db", "vdc-leader.db", "SQLite database path")
+	logPath := fs.String("log", "vdc-leader.log", "log file path")
 	heartbeatTimeout := fs.Duration("heartbeat_timeout", 30*time.Second, "time before a silent machine is considered lost")
 	fs.Parse(args)
 
-	srv, err := server.New(server.Config{PackageDir: *packageDir, DBPath: *dbPath})
+	srv, err := server.New(server.Config{PackageDir: *packageDir, DBPath: *dbPath, LogPath: *logPath})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "server init: %v\n", err)
 		os.Exit(1)
@@ -30,7 +31,7 @@ func cmdLeader(args []string) {
 	}()
 	go srv.RunLoop(*heartbeatTimeout, 60*time.Second)
 
-	fmt.Printf("VDC leader listening on :%d  (packages: %s)\n", *port, srv.PackageDir())
+	fmt.Printf("VDC leader listening on :%d  (packages: %s  log: %s)\n", *port, srv.PackageDir(), srv.LogPath())
 	printStatus(srv)
 }
 
@@ -39,6 +40,8 @@ func printStatus(srv *server.Server) {
 		snap := srv.Status()
 
 		fmt.Print("\033[H\033[2J") // clear screen
+
+		fmt.Printf("Log: %s\n\n", srv.LogPath())
 
 		// Machines
 		fmt.Printf("MACHINES (%d)\n", len(snap.Machines))

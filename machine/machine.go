@@ -251,6 +251,7 @@ func (m *Machine) runBinary(details *api.RunBinaryDetails) error {
 
 	binaryPath := filepath.Join(m.BaseDir, "packages", details.PackageName, details.BinaryPath)
 	cmd := exec.Command(binaryPath, details.Args...)
+	cmd.Dir = runDir
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 
