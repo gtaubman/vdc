@@ -300,12 +300,18 @@
       border-radius: 5px;
       font-size: 11.5px;
       font-weight: 500;
-      cursor: default;
+      text-decoration: none;
       border: 1px solid #e6e2d8;
       background: #fff;
       color: #6e6b63;
       white-space: nowrap;
       margin-right: 4px;
+      transition: background 0.1s, border-color 0.1s, color 0.1s;
+    }
+    .btn-log:hover {
+      background: #e3eefb;
+      border-color: #c0d6f5;
+      color: #2260aa;
     }
 
     /* ── Badges ──────────────────────────────── */
@@ -463,10 +469,10 @@
         <div class="table-wrap">
           <table>
             <thead><tr>
-              <th>Status</th><th>Job</th><th>Run ID</th><th>Progress</th><th>Replicas</th><th></th>
+              <th>Status</th><th>Job</th><th>Run ID</th><th>Progress</th><th>Replicas</th>
             </tr></thead>
             <tbody id="jobs-tbody">
-              <tr class="empty-row"><td colspan="6">No jobs</td></tr>
+              <tr class="empty-row"><td colspan="5">No jobs</td></tr>
             </tbody>
           </table>
         </div>
@@ -752,21 +758,13 @@
       jt.innerHTML = runs.map(function(r) {
         var info   = RUN_STATUS[r.Status] || ['pending', 'unknown', false];
         var tasks  = r.Tasks || [];
-        var isLive = r.Status <= 2;
-        var isDone = r.Status === 3;
         var actionHtml = '';
-        if (isLive) {
-          actionHtml = '<button class="btn-sm btn-cancel" onclick="event.stopPropagation()">Cancel</button>';
-        } else if (isDone) {
-          actionHtml = '<button class="btn-sm btn-pull"   onclick="event.stopPropagation()">Pull files</button>';
-        }
         return '<tr class="row-link" onclick="showJobDetail(\'' + r.RunID + '\')">' +
           '<td>' + badge(info[0], info[1], info[2]) + '</td>' +
           '<td class="text-dark">' + esc(r.JobName) + '</td>' +
           '<td><span class="hash-chip">' + esc(r.RunID.slice(0, 8)) + '</span></td>' +
           '<td>' + progHtml(tasks) + '</td>' +
           '<td>' + r.Replicas + '</td>' +
-          '<td>' + actionHtml + '</td>' +
         '</tr>';
       }).join('');
     }
@@ -869,7 +867,10 @@
           exitHtml = '<span class="text-muted">—</span>';
         }
 
-        var logBtns = '<span class="btn-log">stdout ↗</span><span class="btn-log">stderr ↗</span>';
+        var logBase = '/api/log?runID=' + encodeURIComponent(selectedRunID) + '&task=' + t.TaskNumber + '&file=';
+        var logBtns =
+          '<a class="btn-log" href="' + logBase + 'STDOUT" target="_blank">stdout ↗</a>' +
+          '<a class="btn-log" href="' + logBase + 'STDERR" target="_blank">stderr ↗</a>';
 
         return '<tr>' +
           '<td class="mono text-muted">' + t.TaskNumber + '</td>' +
