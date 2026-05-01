@@ -19,6 +19,8 @@ func main() {
 		cmdRun(os.Args[2:])
 	case "pull":
 		cmdPull(os.Args[2:])
+	case "web":
+		cmdWeb(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
 		usage()
@@ -28,5 +30,5 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: vdc <command> [flags]")
-	fmt.Fprintln(os.Stderr, "commands: leader, join, run, pull")
+	fmt.Fprintln(os.Stderr, "commands: leader, join, run, pull, web")
 }

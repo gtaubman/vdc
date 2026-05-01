@@ -3,6 +3,7 @@ package client
 import (
 	"fmt"
 	"net/rpc"
+	"net/rpc/jsonrpc"
 	"vdc/api"
 	"vdc/jobspec"
 )
@@ -12,11 +13,11 @@ type Client struct {
 	rpc *rpc.Client
 }
 
-// Dial connects to a VDC leader at host:port.
+// Dial connects to a VDC leader at host:port using JSON-RPC.
 func Dial(host string, port int) (*Client, error) {
-	c, err := rpc.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
+	c, err := jsonrpc.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
 	if err != nil {
-		return nil, fmt.Errorf("rpc.Dial: %w", err)
+		return nil, fmt.Errorf("jsonrpc.Dial: %w", err)
 	}
 	return &Client{rpc: c}, nil
 }
@@ -122,8 +123,9 @@ func (c *Client) GetPullResult(requestID string) (received, total int, done bool
 }
 
 // ReportTaskStatus reports a task's lifecycle state to the server.
-func (c *Client) ReportTaskStatus(taskRunID string, status api.TaskStatus) error {
-	args := &api.ReportTaskStatusRequest{TaskRunID: taskRunID, Status: status}
+// exitCode should be non-nil when status is TaskComplete or TaskFailed.
+func (c *Client) ReportTaskStatus(taskRunID string, status api.TaskStatus, exitCode *int) error {
+	args := &api.ReportTaskStatusRequest{TaskRunID: taskRunID, Status: status, ExitCode: exitCode}
 	reply := &api.ReportTaskStatusReply{}
 	return c.rpc.Call("Server.ReportTaskStatus", args, reply)
 }
@@ -136,6 +138,16 @@ func (c *Client) GetRunStatus(runID string) (api.RunStatus, error) {
 		return 0, err
 	}
 	return reply.Status, nil
+}
+
+// GetStatus returns a point-in-time snapshot of the datacenter.
+func (c *Client) GetStatus() (api.GetStatusReply, error) {
+	args := &api.GetStatusRequest{}
+	reply := &api.GetStatusReply{}
+	if err := c.rpc.Call("Server.GetStatus", args, reply); err != nil {
+		return api.GetStatusReply{}, err
+	}
+	return *reply, nil
 }
 
 // Close closes the connection.

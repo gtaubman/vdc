@@ -1,0 +1,932 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VDC</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #f7f6f3;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 14px;
+      color: #1a1a1a;
+      display: flex;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ── Sidebar ─────────────────────────────── */
+    .sidebar {
+      width: 224px;
+      flex-shrink: 0;
+      background: #fff;
+      border-right: 1px solid #e6e2d8;
+      display: flex;
+      flex-direction: column;
+      padding: 0 12px 16px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 18px 4px 20px;
+    }
+    .brand-icon {
+      width: 30px;
+      height: 30px;
+      background: #1a1a1a;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: ui-monospace, monospace;
+      font-size: 11px;
+      font-weight: 700;
+      color: #f7f6f3;
+      flex-shrink: 0;
+    }
+    .brand-name { font-size: 14px; font-weight: 600; color: #1a1a1a; line-height: 1.2; }
+    .brand-desc { font-size: 11.5px; color: #9a968a; }
+
+    .nav { display: flex; flex-direction: column; gap: 2px; }
+    .nav-item {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 7px 10px;
+      border-radius: 6px;
+      font-size: 13.5px;
+      font-weight: 500;
+      color: #4a4843;
+      cursor: pointer;
+      user-select: none;
+      transition: background 0.1s, color 0.1s;
+    }
+    .nav-item:hover { background: #f1efea; }
+    .nav-item.active { background: #ecebfa; color: #4f46cc; }
+    .nav-icon { width: 16px; height: 16px; flex-shrink: 0; }
+
+    /* ── Main ────────────────────────────────── */
+    .main { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+
+    .topbar {
+      height: 52px;
+      background: #fff;
+      border-bottom: 1px solid #e6e2d8;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 28px;
+      flex-shrink: 0;
+    }
+    .topbar-left { display: flex; align-items: center; gap: 6px; font-size: 13.5px; color: #6e6b63; }
+    .topbar-sep { color: #c8c4bb; }
+    .topbar-page { color: #1a1a1a; font-weight: 500; }
+    .topbar-page.link { cursor: pointer; color: #6e6b63; font-weight: 400; }
+    .topbar-page.link:hover { color: #1a1a1a; }
+    .topbar-sub { color: #1a1a1a; font-weight: 500; }
+    .topbar-right { display: flex; align-items: center; gap: 7px; }
+    .status-dot { width: 7px; height: 7px; border-radius: 50%; background: #d1cecc; transition: background 0.3s; }
+    .status-dot.live { background: #2f8a3a; }
+    .status-text { font-size: 12px; color: #9a968a; }
+
+    .content { flex: 1; overflow-y: auto; padding: 24px 28px; }
+
+    /* ── Stat cards ──────────────────────────── */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      background: #fff;
+      border: 1px solid #e6e2d8;
+      border-radius: 10px;
+      overflow: hidden;
+      margin-bottom: 28px;
+    }
+    .stat-card {
+      padding: 20px 24px 18px;
+      border-right: 1px solid #e6e2d8;
+    }
+    .stat-card:last-child { border-right: none; }
+    .stat-label { font-size: 11.5px; font-weight: 500; color: #9a968a; letter-spacing: 0.01em; margin-bottom: 8px; }
+    .stat-value {
+      font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+      font-size: 27px;
+      font-weight: 600;
+      color: #1a1a1a;
+      letter-spacing: -0.5px;
+      margin-bottom: 10px;
+      line-height: 1;
+    }
+    .stat-bar { height: 4px; background: #f1efea; border-radius: 2px; overflow: hidden; }
+    .stat-bar-fill { height: 100%; border-radius: 2px; transition: width 0.4s ease; }
+    .bar-green { background: #2f8a3a; }
+    .bar-amber { background: #b8800f; }
+    .bar-red   { background: #c4392a; }
+
+    /* ── Sections ────────────────────────────── */
+    .section { margin-bottom: 28px; }
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 10px;
+    }
+    .section-title { font-size: 14px; font-weight: 600; color: #1a1a1a; }
+    .section-count {
+      font-size: 12px;
+      color: #9a968a;
+      background: #f1efea;
+      padding: 1px 8px;
+      border-radius: 10px;
+      font-weight: 500;
+    }
+
+    /* ── Table ───────────────────────────────── */
+    .table-wrap { background: #fff; border: 1px solid #e6e2d8; border-radius: 10px; overflow: hidden; }
+    table { width: 100%; border-collapse: collapse; }
+    thead th {
+      background: #faf9f6;
+      padding: 9px 16px;
+      text-align: left;
+      font-size: 11px;
+      font-weight: 600;
+      color: #9a968a;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      border-bottom: 1px solid #e6e2d8;
+      white-space: nowrap;
+    }
+    tbody td {
+      padding: 11px 16px;
+      border-bottom: 1px solid #f1efea;
+      font-size: 13.5px;
+      color: #4a4843;
+      vertical-align: middle;
+    }
+    tbody tr:last-child td { border-bottom: none; }
+    tbody tr:hover td { background: #faf9f6; }
+    .empty-row td {
+      padding: 32px 16px;
+      text-align: center;
+      color: #9a968a;
+      font-size: 13.5px;
+    }
+    .row-link { cursor: pointer; }
+    .row-link:hover td { background: #f1efea !important; }
+
+    /* ── Progress bar ────────────────────────── */
+    .prog-wrap { display: flex; flex-direction: column; gap: 5px; min-width: 140px; }
+    .prog-bar {
+      display: flex;
+      height: 5px;
+      border-radius: 3px;
+      overflow: hidden;
+      background: #f1efea;
+    }
+    .prog-seg { height: 100%; transition: width 0.4s ease; }
+    .prog-green { background: #2f8a3a; }
+    .prog-red   { background: #c4392a; }
+    .prog-amber { background: #b8800f; }
+    .prog-text  { font-size: 11.5px; color: #9a968a; white-space: nowrap; }
+    .prog-text .cnt-fail { color: #c4392a; }
+    .prog-text .cnt-lost { color: #b8800f; }
+
+    /* ── Hash chip ───────────────────────────── */
+    .hash-chip {
+      display: inline-block;
+      font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+      font-size: 11px;
+      background: #f1efea;
+      color: #6e6b63;
+      padding: 2px 7px;
+      border-radius: 4px;
+      border: 1px solid #e6e2d8;
+      letter-spacing: 0.02em;
+    }
+
+    /* ── Buttons ─────────────────────────────── */
+    .btn-sm {
+      display: inline-block;
+      padding: 4px 11px;
+      border-radius: 5px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      border: 1px solid #e6e2d8;
+      background: #fff;
+      color: #6e6b63;
+      white-space: nowrap;
+      transition: background 0.1s, border-color 0.1s, color 0.1s;
+    }
+    .btn-sm:hover { background: #f1efea; }
+    .btn-cancel:hover { background: #fde8e6; border-color: #f7c9c4; color: #a83020; }
+    .btn-pull:hover   { background: #e3eefb; border-color: #c0d6f5; color: #2260aa; }
+
+    /* ── Job detail ──────────────────────────── */
+    .detail-card {
+      background: #fff;
+      border: 1px solid #e6e2d8;
+      border-radius: 10px;
+      padding: 22px 24px 20px;
+      margin-bottom: 28px;
+    }
+    .detail-header-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 18px;
+      flex-wrap: wrap;
+    }
+    .detail-header-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .detail-name {
+      font-size: 22px;
+      font-weight: 700;
+      color: #1a1a1a;
+      letter-spacing: -0.3px;
+    }
+    .detail-started {
+      font-size: 12.5px;
+      color: #9a968a;
+      white-space: nowrap;
+    }
+
+    .detail-stats {
+      display: flex;
+      gap: 0;
+      padding-top: 16px;
+      border-top: 1px solid #f1efea;
+      flex-wrap: wrap;
+    }
+    .detail-stat {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      padding-right: 36px;
+    }
+    .detail-stat:last-child { padding-right: 0; }
+    .detail-stat-label {
+      font-size: 10.5px;
+      font-weight: 600;
+      color: #9a968a;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+    }
+    .detail-stat-value {
+      font-size: 15px;
+      font-weight: 600;
+      color: #1a1a1a;
+      font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+    }
+    .detail-stat-value.green { color: #2a7531; }
+    .detail-stat-value.blue  { color: #2260aa; }
+    .detail-stat-value.red   { color: #c4392a; }
+    .detail-stat-value.amber { color: #b8800f; }
+    .detail-stat-value.muted { color: #c8c4bb; }
+
+    /* ── Log buttons ─────────────────────────── */
+    .btn-log {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 9px;
+      border-radius: 5px;
+      font-size: 11.5px;
+      font-weight: 500;
+      cursor: default;
+      border: 1px solid #e6e2d8;
+      background: #fff;
+      color: #6e6b63;
+      white-space: nowrap;
+      margin-right: 4px;
+    }
+
+    /* ── Badges ──────────────────────────────── */
+    @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 9px 3px 7px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+    .badge-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+    .badge-dot.anim { animation: pulse-dot 1.8s ease-in-out infinite; }
+
+    .badge-online   { background: #e6f3e8; color: #2a7531; }
+    .badge-online   .badge-dot { background: #2f8a3a; }
+    .badge-warning  { background: #fbf1d9; color: #a07010; }
+    .badge-warning  .badge-dot { background: #b8800f; }
+    .badge-offline  { background: #f1efea; color: #6e6b63; }
+    .badge-offline  .badge-dot { background: #6e6b63; }
+    .badge-running  { background: #e3eefb; color: #2260aa; }
+    .badge-running  .badge-dot { background: #2a6ec4; }
+    .badge-complete { background: #e6f3e8; color: #2a7531; }
+    .badge-complete .badge-dot { background: #2f8a3a; }
+    .badge-pending  { background: #f1efea; color: #6e6b63; }
+    .badge-pending  .badge-dot { background: #9a968a; }
+    .badge-failed   { background: #fde8e6; color: #a83020; }
+    .badge-failed   .badge-dot { background: #c4392a; }
+
+    /* ── Helpers ─────────────────────────────── */
+    .mono { font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 12px; }
+    .text-muted { color: #9a968a; }
+    .text-dark  { color: #1a1a1a; font-weight: 500; }
+
+    .error-bar {
+      background: #fde8e6;
+      color: #a83020;
+      border: 1px solid #f7c9c4;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 13px;
+      margin-bottom: 16px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="brand">
+    <div class="brand-icon">vd</div>
+    <div>
+      <div class="brand-name">VDC</div>
+      <div class="brand-desc">Virtual Datacenter</div>
+    </div>
+  </div>
+  <nav class="nav">
+    <div class="nav-item active" id="nav-cluster" onclick="showView('cluster')">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none">
+        <rect x="1.5" y="2" width="13" height="3.5" rx="1.2" fill="currentColor" opacity=".9"/>
+        <rect x="1.5" y="7" width="13" height="3.5" rx="1.2" fill="currentColor" opacity=".9"/>
+        <rect x="1.5" y="12" width="13" height="2" rx="1" fill="currentColor" opacity=".4"/>
+        <circle cx="12.5" cy="3.75" r=".9" fill="#fff"/>
+        <circle cx="12.5" cy="8.75" r=".9" fill="#fff"/>
+      </svg>
+      Cluster
+    </div>
+    <div class="nav-item" id="nav-jobs" onclick="showView('jobs')">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none">
+        <path d="M2 4h12M2 8h12M2 12h7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+      Jobs
+    </div>
+    <div class="nav-item" id="nav-packages" onclick="showView('packages')">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none">
+        <path d="M8 1.5 13.5 4.5v7L8 14.5 2.5 11.5v-7z" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linejoin="round"/>
+        <path d="M2.5 4.5 8 7.5l5.5-3M8 7.5V14.5" stroke="currentColor" stroke-width="1.3"/>
+      </svg>
+      Packages
+    </div>
+  </nav>
+</aside>
+
+<div class="main">
+  <header class="topbar">
+    <div class="topbar-left">
+      <span>VDC</span>
+      <span class="topbar-sep">›</span>
+      <span class="topbar-page" id="topbar-page">Cluster</span>
+      <span class="topbar-sep" id="topbar-sep2" style="display:none">›</span>
+      <span class="topbar-sub" id="topbar-sub"></span>
+    </div>
+    <div class="topbar-right">
+      <span class="status-dot" id="status-dot"></span>
+      <span class="status-text" id="status-text">Connecting…</span>
+    </div>
+  </header>
+
+  <div class="content">
+    <div class="error-bar" id="error-bar"></div>
+
+    <!-- Cluster view -->
+    <div id="view-cluster">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">Machines</div>
+          <div class="stat-value" id="s-machines">—</div>
+          <div class="stat-bar"><div class="stat-bar-fill bar-green" id="s-machines-bar" style="width:0"></div></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Total RAM</div>
+          <div class="stat-value" id="s-ram">—</div>
+          <div class="stat-bar"><div class="stat-bar-fill bar-green" style="width:0"></div></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Total Disk</div>
+          <div class="stat-value" id="s-disk">—</div>
+          <div class="stat-bar"><div class="stat-bar-fill bar-green" style="width:0"></div></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Active Jobs</div>
+          <div class="stat-value" id="s-jobs">—</div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-head">
+          <div class="section-title">Machines</div>
+          <span class="section-count" id="machine-count">0</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Status</th><th>Machine ID</th><th>RAM</th><th>Disk</th><th>Jobs</th><th>Last Seen</th>
+            </tr></thead>
+            <tbody id="machines-tbody">
+              <tr class="empty-row"><td colspan="6">Connecting…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Jobs view -->
+    <div id="view-jobs" style="display:none">
+      <div class="section">
+        <div class="section-head">
+          <div class="section-title">Jobs</div>
+          <span class="section-count" id="jobs-count">0</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Status</th><th>Job</th><th>Run ID</th><th>Progress</th><th>Replicas</th><th></th>
+            </tr></thead>
+            <tbody id="jobs-tbody">
+              <tr class="empty-row"><td colspan="6">No jobs</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Job detail view -->
+    <div id="view-job-detail" style="display:none">
+      <div class="detail-card">
+        <div class="detail-header-row">
+          <div class="detail-header-left">
+            <span class="detail-name" id="detail-name">—</span>
+            <span id="detail-status-badge"></span>
+            <span class="hash-chip mono" id="detail-run-chip"></span>
+          </div>
+          <span class="detail-started" id="detail-started"></span>
+        </div>
+        <div class="detail-stats" id="detail-stats"></div>
+      </div>
+
+      <div class="section">
+        <div class="section-head">
+          <div>
+            <span class="section-title">Tasks</span>
+            <span class="section-count" id="tasks-count" style="margin-left:8px">0</span>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th style="width:40px">#</th>
+              <th>Status</th>
+              <th>Machine</th>
+              <th>Started</th>
+              <th>Duration</th>
+              <th>Exit</th>
+              <th>Logs</th>
+            </tr></thead>
+            <tbody id="tasks-tbody">
+              <tr class="empty-row"><td colspan="7">No tasks</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Packages view -->
+    <div id="view-packages" style="display:none">
+      <div class="section">
+        <div class="section-head">
+          <div class="section-title">Packages</div>
+          <span class="section-count" id="packages-count">0</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Name</th><th>Hash</th>
+            </tr></thead>
+            <tbody id="packages-tbody">
+              <tr class="empty-row"><td colspan="2">No packages</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+(function() {
+  'use strict';
+
+  const GiB = 1073741824;
+  const TiB = GiB * 1024;
+
+  function fmtBytes(b) {
+    if (!b) return '0';
+    if (b >= TiB)     return (b / TiB).toFixed(1).replace(/\.0$/, '') + 'T';
+    if (b >= GiB)     return (b / GiB).toFixed(1).replace(/\.0$/, '') + 'G';
+    if (b >= 1048576) return (b / 1048576).toFixed(1).replace(/\.0$/, '') + 'M';
+    if (b >= 1024)    return (b / 1024).toFixed(1).replace(/\.0$/, '') + 'K';
+    return b + 'B';
+  }
+
+  function fmtAgo(isoStr) {
+    var s = Math.max(0, Math.floor((Date.now() - new Date(isoStr)) / 1000));
+    if (s < 60)   return s + 's ago';
+    if (s < 3600) return Math.floor(s / 60) + 'm' + (s % 60) + 's ago';
+    return Math.floor(s / 3600) + 'h' + Math.floor((s % 3600) / 60) + 'm ago';
+  }
+
+  function pad2(n) { return n < 10 ? '0' + n : String(n); }
+
+  // Format a duration in seconds as HH:MM:SS
+  function fmtDur(sec) {
+    sec = Math.max(0, Math.floor(sec));
+    return pad2(Math.floor(sec / 3600)) + ':' + pad2(Math.floor((sec % 3600) / 60)) + ':' + pad2(sec % 60);
+  }
+
+  // Returns null for Go zero-time ("0001-01-01...")
+  function parseTime(isoStr) {
+    if (!isoStr) return null;
+    var d = new Date(isoStr);
+    return d.getFullYear() > 2000 ? d : null;
+  }
+
+  function machineStatus(isoStr) {
+    var s = (Date.now() - new Date(isoStr)) / 1000;
+    if (s < 30)  return 'online';
+    if (s < 120) return 'warning';
+    return 'offline';
+  }
+
+  // api.RunStatus int -> [badge-class, label, animate?]
+  const RUN_STATUS = {
+    0: ['pending',  'scheduling', true],
+    1: ['pending',  'pending',    false],
+    2: ['running',  'running',    true],
+    3: ['complete', 'complete',   false],
+    4: ['failed',   'partial failure', false],
+    5: ['failed',   'failed',     false],
+    6: ['pending',  'cancelled',  false],
+  };
+
+  // api.TaskStatus int -> [badge-class, label, animate?]
+  const TASK_STATUS = {
+    0: ['pending',  'pending',   false],
+    1: ['running',  'fetching',  true],
+    2: ['running',  'running',   true],
+    3: ['complete', 'complete',  false],
+    4: ['failed',   'failed',    false],
+    5: ['warning',  'lost',      false],
+    6: ['pending',  'cancelled', false],
+  };
+
+  function badge(cls, label, animate) {
+    return '<span class="badge badge-' + cls + '">' +
+      '<span class="badge-dot' + (animate ? ' anim' : '') + '"></span>' +
+      label + '</span>';
+  }
+
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function taskCounts(tasks) {
+    var done = 0, running = 0, fetching = 0, failed = 0, lost = 0, pending = 0, cancelled = 0;
+    tasks.forEach(function(t) {
+      switch (t.Status) {
+        case 0: pending++;   break;
+        case 1: fetching++;  break;
+        case 2: running++;   break;
+        case 3: done++;      break;
+        case 4: failed++;    break;
+        case 5: lost++;      break;
+        case 6: cancelled++; break;
+      }
+    });
+    return { done: done, running: running, fetching: fetching,
+             failed: failed, lost: lost, pending: pending, cancelled: cancelled };
+  }
+
+  function progHtml(tasks) {
+    var total = tasks.length;
+    if (total === 0) return '<span class="text-muted" style="font-size:12px">—</span>';
+    var c = taskCounts(tasks);
+    var donePct   = (c.done   / total * 100).toFixed(1);
+    var failedPct = (c.failed / total * 100).toFixed(1);
+    var lostPct   = (c.lost   / total * 100).toFixed(1);
+    var textParts = [c.done + '/' + total];
+    if (c.failed > 0) textParts.push('<span class="cnt-fail">' + c.failed + ' failed</span>');
+    if (c.lost   > 0) textParts.push('<span class="cnt-lost">' + c.lost   + ' lost</span>');
+    return '<div class="prog-wrap">' +
+      '<div class="prog-bar">' +
+        '<div class="prog-seg prog-green" style="width:' + donePct   + '%"></div>' +
+        '<div class="prog-seg prog-red"   style="width:' + failedPct + '%"></div>' +
+        '<div class="prog-seg prog-amber" style="width:' + lostPct   + '%"></div>' +
+      '</div>' +
+      '<span class="prog-text">' + textParts.join(' · ') + '</span>' +
+    '</div>';
+  }
+
+  // ── View switching ────────────────────────────
+  const topViews = ['cluster', 'jobs', 'packages'];
+  const allViews = ['cluster', 'jobs', 'job-detail', 'packages'];
+
+  var currentView   = 'cluster';
+  var selectedRunID = null;
+  var lastData      = null;
+
+  function showView(v) {
+    currentView = v;
+    if (v !== 'job-detail') selectedRunID = null;
+
+    allViews.forEach(function(name) {
+      document.getElementById('view-' + name).style.display = name === v ? '' : 'none';
+    });
+
+    topViews.forEach(function(name) {
+      var isActive = name === v || (v === 'job-detail' && name === 'jobs');
+      document.getElementById('nav-' + name).classList.toggle('active', isActive);
+    });
+
+    var pageEl = document.getElementById('topbar-page');
+    var sep2El = document.getElementById('topbar-sep2');
+    var subEl  = document.getElementById('topbar-sub');
+
+    if (v === 'job-detail') {
+      pageEl.textContent   = 'Jobs';
+      pageEl.className     = 'topbar-page link';
+      pageEl.onclick       = function() { showView('jobs'); };
+      sep2El.style.display = '';
+    } else {
+      var titles = { cluster: 'Cluster', jobs: 'Jobs', packages: 'Packages' };
+      pageEl.textContent   = titles[v] || v;
+      pageEl.className     = 'topbar-page';
+      pageEl.onclick       = null;
+      sep2El.style.display = 'none';
+      subEl.textContent    = '';
+    }
+
+    if (lastData) render(lastData);
+  }
+  window.showView = showView;
+
+  function showJobDetail(runID) {
+    selectedRunID = runID;
+    showView('job-detail');
+  }
+  window.showJobDetail = showJobDetail;
+
+  // ── Rendering ─────────────────────────────────
+  function render(data) {
+    lastData = data;
+    var machines  = data.Machines        || [];
+    var jobCounts = data.MachineJobCounts || {};
+    var runs      = data.Runs             || [];
+    var packages  = data.Packages         || [];
+
+    var totalRAM  = machines.reduce(function(s, m) { return s + m.Spec.RAM;  }, 0);
+    var totalDisk = machines.reduce(function(s, m) { return s + m.Spec.Disk; }, 0);
+    var activeM   = machines.filter(function(m) { return machineStatus(m.LastHeartbeat) !== 'offline'; }).length;
+    var activeJ   = runs.filter(function(r) { return r.Status === 2; }).length;
+
+    document.getElementById('s-machines').textContent = activeM + ' / ' + machines.length;
+    document.getElementById('s-ram').textContent      = totalRAM  ? fmtBytes(totalRAM)  : '—';
+    document.getElementById('s-disk').textContent     = totalDisk ? fmtBytes(totalDisk) : '—';
+    document.getElementById('s-jobs').textContent     = String(activeJ);
+
+    var mRatio = machines.length ? activeM / machines.length : 0;
+    document.getElementById('s-machines-bar').style.width = (mRatio * 100) + '%';
+
+    document.getElementById('machine-count').textContent  = machines.length;
+    document.getElementById('jobs-count').textContent     = runs.length;
+    document.getElementById('packages-count').textContent = packages.length;
+
+    // Machines table
+    var mt = document.getElementById('machines-tbody');
+    if (machines.length === 0) {
+      mt.innerHTML = '<tr class="empty-row"><td colspan="6">No machines connected</td></tr>';
+    } else {
+      mt.innerHTML = machines.map(function(m) {
+        var st   = machineStatus(m.LastHeartbeat);
+        var jobs = jobCounts[m.ID] || 0;
+        return '<tr>' +
+          '<td>' + badge(st, st, st === 'online') + '</td>' +
+          '<td><span class="mono text-dark">' + esc(m.ID.slice(0, 8)) + '</span>' +
+              '<span class="mono text-muted">…' + esc(m.ID.slice(-4)) + '</span></td>' +
+          '<td>' + fmtBytes(m.Spec.RAM)  + '</td>' +
+          '<td>' + fmtBytes(m.Spec.Disk) + '</td>' +
+          '<td>' + (jobs > 0 ? '<strong>' + jobs + '</strong>' : '<span class="text-muted">0</span>') + '</td>' +
+          '<td class="mono text-muted">' + fmtAgo(m.LastHeartbeat) + '</td>' +
+        '</tr>';
+      }).join('');
+    }
+
+    // Jobs table
+    var jt = document.getElementById('jobs-tbody');
+    if (runs.length === 0) {
+      jt.innerHTML = '<tr class="empty-row"><td colspan="6">No jobs</td></tr>';
+    } else {
+      jt.innerHTML = runs.map(function(r) {
+        var info   = RUN_STATUS[r.Status] || ['pending', 'unknown', false];
+        var tasks  = r.Tasks || [];
+        var isLive = r.Status <= 2;
+        var isDone = r.Status === 3;
+        var actionHtml = '';
+        if (isLive) {
+          actionHtml = '<button class="btn-sm btn-cancel" onclick="event.stopPropagation()">Cancel</button>';
+        } else if (isDone) {
+          actionHtml = '<button class="btn-sm btn-pull"   onclick="event.stopPropagation()">Pull files</button>';
+        }
+        return '<tr class="row-link" onclick="showJobDetail(\'' + r.RunID + '\')">' +
+          '<td>' + badge(info[0], info[1], info[2]) + '</td>' +
+          '<td class="text-dark">' + esc(r.JobName) + '</td>' +
+          '<td><span class="hash-chip">' + esc(r.RunID.slice(0, 8)) + '</span></td>' +
+          '<td>' + progHtml(tasks) + '</td>' +
+          '<td>' + r.Replicas + '</td>' +
+          '<td>' + actionHtml + '</td>' +
+        '</tr>';
+      }).join('');
+    }
+
+    // Job detail
+    if (currentView === 'job-detail' && selectedRunID) {
+      renderJobDetail(runs);
+    }
+
+    // Packages table
+    var pt = document.getElementById('packages-tbody');
+    if (packages.length === 0) {
+      pt.innerHTML = '<tr class="empty-row"><td colspan="2">No packages</td></tr>';
+    } else {
+      pt.innerHTML = packages.map(function(p) {
+        return '<tr>' +
+          '<td>' + esc(p.Name || '—') + '</td>' +
+          '<td><span class="hash-chip">' + esc(p.Hash.slice(0, 16)) + '…</span></td>' +
+        '</tr>';
+      }).join('');
+    }
+  }
+
+  function renderJobDetail(runs) {
+    var run = null;
+    for (var i = 0; i < runs.length; i++) {
+      if (runs[i].RunID === selectedRunID) { run = runs[i]; break; }
+    }
+
+    if (!run) {
+      document.getElementById('detail-name').textContent       = 'Job not found';
+      document.getElementById('detail-status-badge').innerHTML = '';
+      document.getElementById('detail-run-chip').textContent   = selectedRunID ? selectedRunID.slice(0, 8) : '';
+      document.getElementById('detail-started').textContent    = '';
+      document.getElementById('detail-stats').innerHTML        = '';
+      document.getElementById('tasks-count').textContent       = '0';
+      document.getElementById('tasks-tbody').innerHTML         =
+        '<tr class="empty-row"><td colspan="7">Run not found</td></tr>';
+      document.getElementById('topbar-sub').textContent        = '';
+      return;
+    }
+
+    var info = RUN_STATUS[run.Status] || ['pending', 'unknown', false];
+    document.getElementById('detail-name').textContent       = run.JobName;
+    document.getElementById('detail-status-badge').innerHTML = badge(info[0], info[1], info[2]);
+    document.getElementById('detail-run-chip').textContent   = run.RunID.slice(0, 8);
+    document.getElementById('topbar-sub').textContent        = run.JobName;
+
+    var runStarted = parseTime(run.StartedAt);
+    document.getElementById('detail-started').textContent = runStarted
+      ? 'Started ' + fmtDur(Math.floor((Date.now() - runStarted) / 1000)) + ' ago'
+      : '';
+
+    var tasks = run.Tasks || [];
+    var c = taskCounts(tasks);
+
+    // stats row: binary | package | replicas | complete | running | pending | failed | lost
+    var completeVal = c.done + '/' + run.Replicas;
+    document.getElementById('detail-stats').innerHTML =
+      stat('Binary',   run.Binary  || '—', '') +
+      stat('Package',  run.Package || '—', '') +
+      stat('Replicas', String(run.Replicas), '') +
+      stat('Complete', completeVal, c.done > 0 ? 'green' : '') +
+      stat('Running',  String(c.running + c.fetching), c.running + c.fetching > 0 ? 'blue' : '') +
+      stat('Pending',  String(c.pending),  '') +
+      stat('Failed',   String(c.failed),   c.failed > 0 ? 'red'   : 'muted') +
+      stat('Lost',     String(c.lost),     c.lost   > 0 ? 'amber' : 'muted');
+
+    document.getElementById('tasks-count').textContent = tasks.length;
+
+    var now = Date.now();
+    var tb = document.getElementById('tasks-tbody');
+    if (tasks.length === 0) {
+      tb.innerHTML = '<tr class="empty-row"><td colspan="7">No tasks yet</td></tr>';
+    } else {
+      tb.innerHTML = tasks.map(function(t) {
+        var tinfo    = TASK_STATUS[t.Status] || ['pending', 'unknown', false];
+        var machine  = t.MachineID
+          ? '<span class="mono">' + esc(t.MachineID.slice(0, 8)) + '</span>' +
+            '<span class="mono text-muted">…' + esc(t.MachineID.slice(-4)) + '</span>'
+          : '<span class="text-muted">—</span>';
+
+        var tStarted  = parseTime(t.StartedAt);
+        var tFinished = parseTime(t.FinishedAt);
+
+        var startedHtml  = tStarted
+          ? '<span class="mono">' + fmtDur(Math.floor((now - tStarted) / 1000)) + '</span>'
+          : '<span class="text-muted">—</span>';
+
+        var durationHtml = (tStarted && tFinished)
+          ? '<span class="mono">' + fmtDur(Math.floor((tFinished - tStarted) / 1000)) + '</span>'
+          : '<span class="text-muted">—</span>';
+
+        var exitHtml;
+        if (t.ExitCode !== null && t.ExitCode !== undefined) {
+          exitHtml = t.ExitCode === 0
+            ? '<span class="mono" style="color:#2a7531">' + t.ExitCode + '</span>'
+            : '<span class="mono" style="color:#c4392a">' + t.ExitCode + '</span>';
+        } else {
+          exitHtml = '<span class="text-muted">—</span>';
+        }
+
+        var logBtns = '<span class="btn-log">stdout ↗</span><span class="btn-log">stderr ↗</span>';
+
+        return '<tr>' +
+          '<td class="mono text-muted">' + t.TaskNumber + '</td>' +
+          '<td>'                         + badge(tinfo[0], tinfo[1], tinfo[2]) + '</td>' +
+          '<td>'                         + machine      + '</td>' +
+          '<td>'                         + startedHtml  + '</td>' +
+          '<td>'                         + durationHtml + '</td>' +
+          '<td>'                         + exitHtml     + '</td>' +
+          '<td>'                         + logBtns      + '</td>' +
+        '</tr>';
+      }).join('');
+    }
+  }
+
+  function stat(label, value, colorCls) {
+    return '<div class="detail-stat">' +
+      '<span class="detail-stat-label">' + label + '</span>' +
+      '<span class="detail-stat-value' + (colorCls ? ' ' + colorCls : '') + '">' + esc(value) + '</span>' +
+    '</div>';
+  }
+
+  // ── Status indicator ──────────────────────────
+  function setLive(ok) {
+    document.getElementById('status-dot').className    = 'status-dot' + (ok ? ' live' : '');
+    document.getElementById('status-text').textContent = ok ? 'Live' : 'Disconnected';
+  }
+
+  function showError(msg) {
+    var el = document.getElementById('error-bar');
+    el.style.display = 'block';
+    el.textContent = msg;
+  }
+  function clearError() {
+    document.getElementById('error-bar').style.display = 'none';
+  }
+
+  // ── Polling ───────────────────────────────────
+  function poll() {
+    fetch('/api/status')
+      .then(function(resp) {
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        return resp.json();
+      })
+      .then(function(data) {
+        clearError();
+        setLive(true);
+        render(data);
+      })
+      .catch(function(e) {
+        setLive(false);
+        showError('Cannot reach VDC leader: ' + e.message);
+      });
+  }
+
+  poll();
+  setInterval(poll, 2000);
+})();
+</script>
+</body>
+</html>

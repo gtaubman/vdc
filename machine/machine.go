@@ -249,7 +249,7 @@ func (m *Machine) runBinary(details *api.RunBinaryDetails) error {
 
 	m.logger.Printf("task %s: starting %s %v", shortID(details.RunID), details.BinaryPath, details.Args)
 
-	if err := c.ReportTaskStatus(details.RunID, api.TaskRunning); err != nil {
+	if err := c.ReportTaskStatus(details.RunID, api.TaskRunning, nil); err != nil {
 		return fmt.Errorf("report task running: %w", err)
 	}
 
@@ -277,7 +277,8 @@ func (m *Machine) runBinary(details *api.RunBinaryDetails) error {
 	cmd.Stderr = stderr
 
 	if err := cmd.Start(); err != nil {
-		_ = c.ReportTaskStatus(details.RunID, api.TaskFailed)
+		ec := -1
+		_ = c.ReportTaskStatus(details.RunID, api.TaskFailed, &ec)
 		return fmt.Errorf("start binary: %w", err)
 	}
 
@@ -291,14 +292,20 @@ func (m *Machine) runBinary(details *api.RunBinaryDetails) error {
 	delete(m.activeRuns, details.RunID)
 	m.activeMu.Unlock()
 
+	exitCode := 0
 	status := api.TaskComplete
 	if runErr != nil {
 		status = api.TaskFailed
-		m.logger.Printf("task %s: failed: %v", shortID(details.RunID), runErr)
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = 1
+		}
+		m.logger.Printf("task %s: failed (exit %d): %v", shortID(details.RunID), exitCode, runErr)
 	} else {
 		m.logger.Printf("task %s: complete", shortID(details.RunID))
 	}
-	if err := c.ReportTaskStatus(details.RunID, status); err != nil {
+	if err := c.ReportTaskStatus(details.RunID, status, &exitCode); err != nil {
 		return fmt.Errorf("report task complete: %w", err)
 	}
 	return runErr

@@ -141,6 +141,7 @@ func (s RunStatus) String() string {
 type ReportTaskStatusRequest struct {
 	TaskRunID string
 	Status    TaskStatus
+	ExitCode  *int // non-nil when Status is TaskComplete or TaskFailed
 }
 
 // ReportTaskStatusReply is the reply from the ReportTaskStatus RPC.
@@ -265,4 +266,44 @@ type GetPullResultReply struct {
 	Done     bool
 	TarData  []byte          // tar of <taskNumber>.<filename> entries; populated when Done
 	Errors   []PullFileError // per-task errors, if any
+}
+
+// TaskSummary is a brief description of one task within a run.
+type TaskSummary struct {
+	TaskNumber int
+	TaskRunID  string
+	MachineID  string
+	Status     TaskStatus
+	StartedAt  time.Time // zero if task hasn't started
+	FinishedAt time.Time // zero if task hasn't finished
+	ExitCode   *int      // nil if task hasn't finished
+}
+
+// RunSummary is a brief description of a run.
+type RunSummary struct {
+	RunID     string
+	JobName   string
+	Status    RunStatus
+	Replicas  int
+	Binary    string    // executable path from job spec
+	Package   string    // package name from job spec
+	StartedAt time.Time // zero if run hasn't started yet
+	Tasks     []TaskSummary
+}
+
+// PackageInfo pairs a package name with its content hash.
+type PackageInfo struct {
+	Name string
+	Hash string
+}
+
+// GetStatusRequest is the argument to the GetStatus RPC.
+type GetStatusRequest struct{}
+
+// GetStatusReply is a point-in-time view of the datacenter.
+type GetStatusReply struct {
+	Machines         []MachineInfo
+	MachineJobCounts map[string]int
+	Packages         []PackageInfo
+	Runs             []RunSummary
 }

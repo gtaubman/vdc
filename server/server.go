@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/rpc"
+	"net/rpc/jsonrpc"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -36,14 +37,18 @@ CREATE TABLE IF NOT EXISTS runs (
 	job_name TEXT NOT NULL,
 	spec_json TEXT NOT NULL,
 	package_hashes_json TEXT NOT NULL,
-	status INTEGER NOT NULL
+	status INTEGER NOT NULL,
+	started_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS tasks (
 	task_run_id TEXT PRIMARY KEY,
 	run_id TEXT NOT NULL,
 	task_number INTEGER NOT NULL,
 	machine_id TEXT,
-	status INTEGER NOT NULL
+	status INTEGER NOT NULL,
+	started_at INTEGER,
+	finished_at INTEGER,
+	exit_code INTEGER
 );
 CREATE TABLE IF NOT EXISTS commands (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,36 +76,6 @@ type Config struct {
 	PackageDir string
 	DBPath     string // SQLite path; "" uses ":memory:"
 	LogPath    string // log file path; "" logs to stderr
-}
-
-// TaskSummary is a brief description of one task for the status display.
-type TaskSummary struct {
-	TaskNumber int
-	MachineID  string
-	Status     api.TaskStatus
-}
-
-// RunSummary is a brief description of a run for the status display.
-type RunSummary struct {
-	RunID    string
-	JobName  string
-	Status   api.RunStatus
-	Replicas int
-	Tasks    []TaskSummary
-}
-
-// PackageInfo pairs a package name with its content hash.
-type PackageInfo struct {
-	Name string
-	Hash string
-}
-
-// StatusSnapshot is a point-in-time view of the datacenter for the leader display.
-type StatusSnapshot struct {
-	Machines         []api.MachineInfo
-	MachineJobCounts map[string]int
-	Packages         []PackageInfo
-	Runs             []RunSummary
 }
 
 type pullFileResult struct {
@@ -145,6 +120,16 @@ func New(cfg Config) (*Server, error) {
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
+	}
+
+	// Migrate existing databases that predate new columns.
+	for _, alter := range []string{
+		`ALTER TABLE runs  ADD COLUMN started_at  INTEGER`,
+		`ALTER TABLE tasks ADD COLUMN started_at  INTEGER`,
+		`ALTER TABLE tasks ADD COLUMN finished_at INTEGER`,
+		`ALTER TABLE tasks ADD COLUMN exit_code   INTEGER`,
+	} {
+		db.Exec(alter) // "duplicate column name" errors are expected and harmless
 	}
 
 	var logger *log.Logger
@@ -330,10 +315,33 @@ func (s *Server) ReportTaskStatus(args *api.ReportTaskStatusRequest, reply *api.
 		return err
 	}
 
+	now := time.Now().UnixNano()
+
 	if _, err := tx.Exec(`UPDATE tasks SET status = ? WHERE task_run_id = ?`,
 		int(args.Status), args.TaskRunID); err != nil {
 		return err
 	}
+
+	// Record when a task first becomes active.
+	if args.Status == api.TaskFetching || args.Status == api.TaskRunning {
+		if _, err := tx.Exec(`UPDATE tasks SET started_at = ? WHERE task_run_id = ? AND started_at IS NULL`,
+			now, args.TaskRunID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE runs SET started_at = ? WHERE run_id = ? AND started_at IS NULL`,
+			now, runID); err != nil {
+			return err
+		}
+	}
+
+	// Record when a task reaches a terminal state.
+	if args.Status == api.TaskComplete || args.Status == api.TaskFailed || args.Status == api.TaskCancelled {
+		if _, err := tx.Exec(`UPDATE tasks SET finished_at = ?, exit_code = ? WHERE task_run_id = ?`,
+			now, args.ExitCode, args.TaskRunID); err != nil {
+			return err
+		}
+	}
+
 	if err := updateRunStatus(tx, runID); err != nil {
 		return err
 	}
@@ -598,7 +606,7 @@ func (s *Server) GetPullResult(args *api.GetPullResultRequest, reply *api.GetPul
 }
 
 // Status returns a point-in-time snapshot of the datacenter for display.
-func (s *Server) Status() StatusSnapshot {
+func (s *Server) Status() api.GetStatusReply {
 	var machines []api.MachineInfo
 	if rows, err := s.db.Query(`SELECT id, ram, disk, last_heartbeat FROM machines`); err == nil {
 		for rows.Next() {
@@ -623,26 +631,42 @@ func (s *Server) Status() StatusSnapshot {
 	}
 
 	entries, _ := os.ReadDir(s.cfg.PackageDir)
-	var packages []PackageInfo
+	var packages []api.PackageInfo
 	for _, e := range entries {
 		if strings.HasSuffix(e.Name(), ".tar") {
 			hash := strings.TrimSuffix(e.Name(), ".tar")
 			var name string
 			s.db.QueryRow(`SELECT name FROM package_names WHERE hash = ?`, hash).Scan(&name)
-			packages = append(packages, PackageInfo{Name: name, Hash: hash})
+			packages = append(packages, api.PackageInfo{Name: name, Hash: hash})
 		}
 	}
 
-	var runs []RunSummary
+	var runs []api.RunSummary
 	if rows, err := s.db.Query(`
-		SELECT r.run_id, r.job_name, r.status, COUNT(t.task_run_id)
+		SELECT r.run_id, r.job_name, r.status, COUNT(t.task_run_id),
+		       r.spec_json, COALESCE(r.started_at, 0)
 		FROM runs r LEFT JOIN tasks t ON r.run_id = t.run_id
 		GROUP BY r.run_id`); err == nil {
 		for rows.Next() {
-			var r RunSummary
+			var r api.RunSummary
 			var status int
-			rows.Scan(&r.RunID, &r.JobName, &status, &r.Replicas)
+			var specJSON string
+			var startedAt int64
+			rows.Scan(&r.RunID, &r.JobName, &status, &r.Replicas, &specJSON, &startedAt)
 			r.Status = api.RunStatus(status)
+			if startedAt > 0 {
+				r.StartedAt = time.Unix(0, startedAt)
+			}
+			var spec struct {
+				Binary struct {
+					Package string `json:"package"`
+					Path    string `json:"path"`
+				} `json:"binary"`
+			}
+			if json.Unmarshal([]byte(specJSON), &spec) == nil {
+				r.Binary = spec.Binary.Path
+				r.Package = spec.Binary.Package
+			}
 			runs = append(runs, r)
 		}
 		rows.Close()
@@ -651,21 +675,35 @@ func (s *Server) Status() StatusSnapshot {
 	// Populate per-task details for each run.
 	for i := range runs {
 		if rows, err := s.db.Query(`
-			SELECT task_number, COALESCE(machine_id, ''), status
+			SELECT task_number, task_run_id, COALESCE(machine_id, ''), status,
+			       COALESCE(started_at, 0), COALESCE(finished_at, 0), exit_code
 			FROM tasks WHERE run_id = ? ORDER BY task_number`,
 			runs[i].RunID); err == nil {
 			for rows.Next() {
-				var ts TaskSummary
+				var ts api.TaskSummary
 				var status int
-				rows.Scan(&ts.TaskNumber, &ts.MachineID, &status)
+				var startedAt, finishedAt int64
+				var exitCode sql.NullInt64
+				rows.Scan(&ts.TaskNumber, &ts.TaskRunID, &ts.MachineID, &status,
+					&startedAt, &finishedAt, &exitCode)
 				ts.Status = api.TaskStatus(status)
+				if startedAt > 0 {
+					ts.StartedAt = time.Unix(0, startedAt)
+				}
+				if finishedAt > 0 {
+					ts.FinishedAt = time.Unix(0, finishedAt)
+				}
+				if exitCode.Valid {
+					ec := int(exitCode.Int64)
+					ts.ExitCode = &ec
+				}
 				runs[i].Tasks = append(runs[i].Tasks, ts)
 			}
 			rows.Close()
 		}
 	}
 
-	return StatusSnapshot{
+	return api.GetStatusReply{
 		Machines:         machines,
 		MachineJobCounts: jobCounts,
 		Packages:         packages,
@@ -673,7 +711,13 @@ func (s *Server) Status() StatusSnapshot {
 	}
 }
 
-// ListenAndServe starts the RPC server on the given port.
+// GetStatus is the RPC entry point for fetching a datacenter snapshot.
+func (s *Server) GetStatus(args *api.GetStatusRequest, reply *api.GetStatusReply) error {
+	*reply = s.Status()
+	return nil
+}
+
+// ListenAndServe starts the JSON-RPC server on the given port.
 func (s *Server) ListenAndServe(port int) error {
 	if err := rpc.Register(s); err != nil {
 		return fmt.Errorf("rpc.Register: %w", err)
@@ -682,8 +726,13 @@ func (s *Server) ListenAndServe(port int) error {
 	if err != nil {
 		return fmt.Errorf("net.Listen: %w", err)
 	}
-	rpc.Accept(ln)
-	return nil
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return err
+		}
+		go jsonrpc.ServeConn(conn)
+	}
 }
 
 func (s *Server) packagePath(hash string) string {
