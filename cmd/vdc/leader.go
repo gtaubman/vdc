@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"time"
+	"vdc/api"
 	"vdc/server"
 )
 
@@ -80,12 +81,20 @@ func printStatus(srv *server.Server) {
 				truncate(r.JobName, 20),
 				r.Status,
 			)
-			for _, t := range r.Tasks {
+			tasks := r.Tasks
+			truncated := r.Status == api.RunComplete && len(tasks) > 3
+			if truncated {
+				tasks = tasks[:3]
+			}
+			for _, t := range tasks {
 				machine := shortID(t.MachineID)
 				if t.MachineID == "" {
 					machine = "(unassigned)"
 				}
 				fmt.Printf("    task %-4d  %-12s  %s\n", t.TaskNumber, t.Status, machine)
+			}
+			if truncated {
+				fmt.Printf("    ... (%d more)\n", len(r.Tasks)-3)
 			}
 		}
 
