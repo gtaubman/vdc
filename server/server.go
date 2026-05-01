@@ -8,6 +8,7 @@ import (
 	"net/rpc"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -213,7 +214,7 @@ func (s *Server) SubmitJob(args *api.SubmitJobRequest, reply *api.SubmitJobReply
 				RunID:       taskRunID,
 				PackageName: spec.Binary.Package,
 				BinaryPath:  spec.Binary.Path,
-				Args:        spec.Args,
+				Args:        expandArgs(spec.Args, i),
 			},
 		})
 	}
@@ -432,6 +433,14 @@ func (s *Server) ListenAndServe(port int) error {
 
 func (s *Server) packagePath(hash string) string {
 	return filepath.Join(s.cfg.PackageDir, hash+".tar")
+}
+
+func expandArgs(args []string, taskNumber int) []string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		out[i] = strings.ReplaceAll(a, "%TASKID%", strconv.Itoa(taskNumber))
+	}
+	return out
 }
 
 func computeRunStatus(tasks []*taskRecord) api.RunStatus {
