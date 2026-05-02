@@ -153,6 +153,7 @@ func (s *Server) tryScheduleRun(runID string) error {
 		if err := insertCommand(tx, a.machineID, api.CmdRunBinary, &api.RunBinaryDetails{
 			RunID:       a.taskRunID,
 			PackageName: spec.Binary.Package,
+			PackageHash: hashes[spec.Binary.Package],
 			BinaryPath:  spec.Binary.Path,
 			Args:        expandArgs(spec.Args, a.taskNumber),
 		}); err != nil {
@@ -315,6 +316,7 @@ func (s *Server) rescheduleTask(taskRunID, runID string, taskNumber int, specJSO
 	if err := insertCommand(tx, machineID, api.CmdRunBinary, &api.RunBinaryDetails{
 		RunID:       newTaskRunID,
 		PackageName: spec.Binary.Package,
+		PackageHash: hashes[spec.Binary.Package],
 		BinaryPath:  spec.Binary.Path,
 		Args:        expandArgs(spec.Args, taskNumber),
 	}); err != nil {

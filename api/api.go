@@ -177,6 +177,7 @@ type FetchPackageDetails struct {
 type RunBinaryDetails struct {
 	RunID       string   // unique ID for this task execution
 	PackageName string
+	PackageHash string   // content hash; used to locate the package directory
 	BinaryPath  string
 	Args        []string
 }

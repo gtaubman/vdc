@@ -232,7 +232,7 @@ func (m *Machine) fetchPackage(details *api.FetchPackageDetails) error {
 	if err != nil {
 		return fmt.Errorf("fetch package %q: %w", details.PackageName, err)
 	}
-	destDir := filepath.Join(m.BaseDir, "packages", details.PackageName)
+	destDir := filepath.Join(m.BaseDir, "packages", details.PackageHash)
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		return fmt.Errorf("mkdir %q: %w", destDir, err)
 	}
@@ -270,7 +270,7 @@ func (m *Machine) runBinary(details *api.RunBinaryDetails) error {
 	}
 	defer stderr.Close()
 
-	binaryPath := filepath.Join(m.BaseDir, "packages", details.PackageName, details.BinaryPath)
+	binaryPath := filepath.Join(m.BaseDir, "packages", details.PackageHash, details.BinaryPath)
 	cmd := exec.Command(binaryPath, details.Args...)
 	cmd.Dir = runDir
 	cmd.Stdout = stdout
