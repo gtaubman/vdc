@@ -3,6 +3,7 @@
 /mapper
 /reducer
 mapreduce/bin/
+mapreduce/driver/driver
 
 # Runtime data
 vdc-leader.db
