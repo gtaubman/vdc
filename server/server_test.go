@@ -364,6 +364,109 @@ func TestIncrementalScheduling(t *testing.T) {
 	}
 }
 
+// TestRunningTaskRescheduledWhenMachineStopsHeartbeating is the core scenario:
+// a machine has advanced a task to TaskRunning, then goes silent (stops
+// heartbeating). The server must detect the stale heartbeat, mark the task
+// TaskLost, and reschedule it on the surviving machine.
+func TestRunningTaskRescheduledWhenMachineStopsHeartbeating(t *testing.T) {
+	srv := newTestServer(t)
+
+	m1 := mustRegister(t, srv, api.MachineSpec{RAM: 1 << 30, Disk: 10 << 30})
+	m2 := mustRegister(t, srv, api.MachineSpec{RAM: 1 << 30, Disk: 10 << 30})
+
+	spec := jobspec.JobSpec{
+		Name:     "running-job",
+		Packages: []jobspec.Package{{Name: "pkg", Files: []string{"bin"}}},
+		Binary:   jobspec.Binary{Package: "pkg", Path: "bin"},
+		Requirements: jobspec.Requirements{
+			RAM:  bytesize.ByteSize(256 << 20),
+			Disk: bytesize.ByteSize(1 << 30),
+		},
+		Replicas: 1,
+	}
+	runID := mustSubmit(t, srv, spec)
+	srv.scheduleNewRuns()
+
+	// Find out which machine was assigned the task and get its task run ID.
+	var runningMachine, taskRunID string
+	srv.db.QueryRow(`SELECT machine_id, task_run_id FROM tasks WHERE run_id = ?`, runID).
+		Scan(&runningMachine, &taskRunID)
+	if runningMachine == "" {
+		t.Fatal("task was not assigned to any machine after scheduling")
+	}
+
+	// Advance the task to TaskRunning — the machine has fetched the package
+	// and started executing the binary.
+	if err := srv.ReportTaskStatus(
+		&api.ReportTaskStatusRequest{TaskRunID: taskRunID, Status: api.TaskRunning},
+		&api.ReportTaskStatusReply{},
+	); err != nil {
+		t.Fatalf("ReportTaskStatus(Running): %v", err)
+	}
+
+	var statusVal int
+	srv.db.QueryRow(`SELECT status FROM tasks WHERE task_run_id = ?`, taskRunID).Scan(&statusVal)
+	if api.TaskStatus(statusVal) != api.TaskRunning {
+		t.Fatalf("pre-condition: task status = %v, want Running", api.TaskStatus(statusVal))
+	}
+
+	// The running machine now goes silent — backdate its heartbeat so it looks
+	// like it has been unreachable for 2 minutes.
+	if _, err := srv.db.Exec(`UPDATE machines SET last_heartbeat = ? WHERE id = ?`,
+		time.Now().Add(-2*time.Minute).UnixNano(), runningMachine); err != nil {
+		t.Fatal(err)
+	}
+
+	// detectAndRescheduleLost with a 1-minute timeout: the machine is 2 minutes
+	// silent and must be declared lost.
+	srv.detectAndRescheduleLost(1 * time.Minute)
+
+	// The lost machine must be removed from the machines table.
+	var machineExists int
+	srv.db.QueryRow(`SELECT COUNT(*) FROM machines WHERE id = ?`, runningMachine).Scan(&machineExists)
+	if machineExists != 0 {
+		t.Error("lost machine was not removed from machines table")
+	}
+
+	// The old task row (TaskRunning on the lost machine) must be gone, replaced
+	// by a fresh row with a new task_run_id assigned to the surviving machine.
+	var newMachine, newTaskRunID string
+	var newStatus int
+	srv.db.QueryRow(`SELECT machine_id, task_run_id, status FROM tasks WHERE run_id = ?`, runID).
+		Scan(&newMachine, &newTaskRunID, &newStatus)
+
+	survivingMachine := m2
+	if runningMachine == m2 {
+		survivingMachine = m1
+	}
+
+	if api.TaskStatus(newStatus) != api.TaskPending {
+		t.Errorf("rescheduled task status = %v, want Pending", api.TaskStatus(newStatus))
+	}
+	if newTaskRunID == taskRunID {
+		t.Error("rescheduled task has the same task_run_id as the lost task")
+	}
+	if newMachine != survivingMachine {
+		t.Errorf("rescheduled task machine = %q, want surviving machine %q", newMachine, survivingMachine)
+	}
+
+	// The surviving machine's command queue must contain FetchPackage and
+	// RunBinary for the rescheduled task.
+	var fetchCount, runCount int
+	for _, cmd := range mustGetCommand(t, srv, survivingMachine) {
+		switch cmd.Type {
+		case api.CmdFetchPackage:
+			fetchCount++
+		case api.CmdRunBinary:
+			runCount++
+		}
+	}
+	if fetchCount != 1 || runCount != 1 {
+		t.Errorf("rescheduled commands on surviving machine: FetchPackage=%d RunBinary=%d, want 1 and 1",
+			fetchCount, runCount)
+	}
+}
+
 func TestReconnectingMachineGetsCancelForRescheduledTask(t *testing.T) {
 	srv := newTestServer(t)
 	mustRegister(t, srv, api.MachineSpec{RAM: 1 << 30, Disk: 10 << 30})
