@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"vdc/api"
 	"vdc/bytesize"
 	"vdc/client"
@@ -76,6 +77,12 @@ func main() {
 		lines := strings.Count(string(chunk), "\n")
 		logf("  chunk-%-3d  %6s lines   %s", i, commas(lines), mib(int64(len(chunk))))
 	}
+
+	localCounts, err := countWordsLocal(*inputFile)
+	if err != nil {
+		fatalf("local count: %v", err)
+	}
+	logf("Local count  %s unique words", commas(len(localCounts)))
 
 	// ── 2. Map package ──────────────────────────────────────────────────────
 
@@ -244,6 +251,46 @@ func main() {
 		fmt.Printf("  %4d  %-22s  %8s\n", i+1, w.word, commas(w.count))
 	}
 
+	// ── Verify ──────────────────────────────────────────────────────────────
+
+	section("", "Verification")
+	logf("Local:     %s unique words", commas(len(localCounts)))
+	logf("MapReduce: %s unique words", commas(len(counts)))
+
+	type mismatch struct{ word string; local, mr int }
+	var mismatches []mismatch
+	for word, localN := range localCounts {
+		if mrN := counts[word]; mrN != localN {
+			mismatches = append(mismatches, mismatch{word, localN, mrN})
+		}
+	}
+	for word, mrN := range counts {
+		if _, ok := localCounts[word]; !ok {
+			mismatches = append(mismatches, mismatch{word, 0, mrN})
+		}
+	}
+	sort.Slice(mismatches, func(i, j int) bool { return mismatches[i].word < mismatches[j].word })
+
+	if len(mismatches) == 0 {
+		logf("PASS  results match exactly")
+	} else {
+		logf("FAIL  %d mismatches:", len(mismatches))
+		shown := mismatches
+		if len(shown) > 20 {
+			shown = shown[:20]
+		}
+		fmt.Printf("\n  %-25s  %10s  %10s\n", "WORD", "LOCAL", "MAPREDUCED")
+		fmt.Printf("  %s\n", strings.Repeat("─", 50))
+		for _, m := range shown {
+			fmt.Printf("  %-25s  %10s  %10s\n", m.word, commas(m.local), commas(m.mr))
+		}
+		if len(mismatches) > 20 {
+			logf("  ... and %d more", len(mismatches)-20)
+		}
+		fmt.Println()
+		os.Exit(1)
+	}
+
 	totalTime := time.Since(totalStart).Round(time.Millisecond * 100)
 	fmt.Printf("\n  %s unique words  ·  map %s  ·  reduce %s  ·  total %s\n\n",
 		commas(len(counts)),
@@ -331,6 +378,26 @@ func waitForPull(c *client.Client, reqID string, total int) ([]byte, []api.PullF
 		_ = received
 		time.Sleep(250 * time.Millisecond)
 	}
+}
+
+// countWordsLocal reads path and counts words using the same tokenization as
+// the mapper: split on non-letter/non-digit characters, lowercase each token.
+func countWordsLocal(path string) (map[string]int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	counts := make(map[string]int)
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		for _, word := range strings.FieldsFunc(scanner.Text(), func(r rune) bool {
+			return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+		}) {
+			counts[strings.ToLower(word)]++
+		}
+	}
+	return counts, scanner.Err()
 }
 
 // splitFile returns numChunks line-balanced byte slices and the total line count.
