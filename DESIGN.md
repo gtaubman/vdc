@@ -32,7 +32,3 @@ This the following optional commandline flags:
 - `--heartbeat_duration` which defaults to 10 seconds which is how often to check in with the server.
 
 Joining will create a net/rpc connection to the leader server and call `RegisterMachine()` with the specs of this server.
-
-## Server Design
-
-The server will have 
